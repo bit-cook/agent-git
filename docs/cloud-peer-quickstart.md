@@ -67,7 +67,12 @@ host is not part of the Desktop-to-executor route described here.
 ## Deployed acceptance runner
 
 `tests/desktop/cloud_live.py` creates isolated local and remote daemon namespaces
-and reads a development login object from stdin. It exercises a real harness
+and reads a disposable login object from stdin. A `token` login exchanges an
+existing access token for an independent test session; cleanup revokes only that
+derived session. Codex acceptance uses `ROOT/codex`, or an explicit
+`--remote-codex-home` inside `--remote-root`. Configure that isolated home before
+running the fixture; the runner never inherits the target user's default Codex
+home or copies its authentication files. It exercises a real harness
 through the deployed relay, replaces a tunnel worker, checks a second turn's
 conversation context, replays events and receipts, and applies an executor
 session deny. SSH only prepares and inspects the remote fixture; session RPCs

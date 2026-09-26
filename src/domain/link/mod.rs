@@ -53,6 +53,9 @@
 //! Not a single `links.json`: writes can fire concurrently (two sessions opened at once), one
 //! file per session drops the read-modify-write race, and file names cannot collide.
 
+mod native_source;
+pub use native_source::NativeBinding;
+
 use crate::Result;
 use crate::adapter;
 use crate::domain::merge_archive::{MergeArchiveRole, RuntimeLinkKey};
@@ -71,6 +74,8 @@ pub struct Link {
     /// The runtime: `codex` / `claude-code`.
     pub source: String,
     pub session_id: String,
+    /// Source-qualified links keep their native thread separate from the local storage key.
+    pub native_binding: Option<NativeBinding>,
     /// The working directory the session runs in.
     pub cwd: Option<String>,
     /// The agent name it belongs to. Absent before the first commit.
@@ -114,6 +119,8 @@ pub struct Link {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct Body {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    native_binding: Option<NativeBinding>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     cwd: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     agent: Option<String>,
@@ -144,6 +151,7 @@ impl Link {
         Link {
             source: source.to_string(),
             session_id: session_id.to_string(),
+            native_binding: None,
             cwd: cwd.map(|p| p.to_string_lossy().to_string()),
             agent: None,
             owner: None,
@@ -165,11 +173,14 @@ impl Link {
             "the session link must be a JSON object"
         );
         let body: Body = serde_json::from_slice(bytes).context("invalid session link fields")?;
-        Ok(from_body(source.to_owned(), session_id.to_owned(), body))
+        let link = from_body(source.to_owned(), session_id.to_owned(), body);
+        link.validate_native_binding()?;
+        Ok(link)
     }
 
     fn body(&self) -> Body {
         Body {
+            native_binding: self.native_binding.clone(),
             cwd: self.cwd.clone(),
             agent: self.agent.clone(),
             owner: self.owner.clone(),
@@ -217,11 +228,15 @@ impl Link {
 
     /// The on-disk JSON. Shared by the tests and `write`, so what you see is what is written.
     pub fn to_json(&self) -> Result<String> {
+        self.validate_native_binding()?;
         Ok(serde_json::to_string_pretty(&self.body())?)
     }
 
     /// Look up the real transcript file.
     pub fn resolve(&self) -> Option<PathBuf> {
+        if self.native_binding.is_some() {
+            return self.resolve_source().ok();
+        }
         let ad = adapter::get(&self.source).ok()?;
         ad.resolve(&self.session_id, self.cwd.as_ref().map(Path::new))
             // Claude Desktop deliberately has no listing/lookup surface of its own: the Code
@@ -247,6 +262,9 @@ impl Link {
     /// root snapshot's session identity is computed from them too), and any encoding round trip
     /// can alter them.
     pub fn read_bytes(&self) -> Result<Vec<u8>> {
+        if self.native_binding.is_some() {
+            return self.read_source_bytes();
+        }
         let adapter = adapter::get(&self.source)?;
         let p = self.resolve().ok_or_else(|| {
             anyhow::anyhow!(
@@ -311,6 +329,7 @@ pub fn lock(store: &Store, source: &str, session_id: &str) -> Result<std::fs::Fi
 }
 
 pub fn write(store: &Store, link: &Link) -> Result<PathBuf> {
+    link.validate_native_binding()?;
     let dir = store.root().join(&link.source);
     crate::infra::config::create_state_dir(&dir)
         .with_context(|| format!("cannot create {}", dir.display()))?;
@@ -428,10 +447,9 @@ pub(crate) fn parse_archive_link_image(
     crate::domain::merge_archive::checked_link_image(&json)?;
     crate::domain::metadata_facts::JsonFacts::parse(&json)?;
     let body: Body = serde_json::from_str(&json).context("archive Link image is unreadable")?;
-    Ok(ArchiveLinkSnapshot {
-        link: from_body(source.to_owned(), session_id.to_owned(), body),
-        json,
-    })
+    let link = from_body(source.to_owned(), session_id.to_owned(), body);
+    link.validate_native_binding()?;
+    Ok(ArchiveLinkSnapshot { link, json })
 }
 
 /// Publish an exact Link image after the command journals its expected and planned states.
@@ -489,6 +507,7 @@ fn from_body(source: String, session_id: String, body: Body) -> Link {
     Link {
         source,
         session_id,
+        native_binding: body.native_binding,
         cwd: body.cwd,
         agent: body.agent,
         owner: body.owner,
@@ -514,7 +533,9 @@ pub fn read(path: &Path) -> Option<Link> {
 fn link_from_body(path: &Path, body: Body) -> Option<Link> {
     let source = path.parent()?.file_name()?.to_str()?.to_string();
     let session_id = path.file_stem()?.to_str()?.to_string();
-    Some(from_body(source, session_id, body))
+    let link = from_body(source, session_id, body);
+    link.validate_native_binding().ok()?;
+    Some(link)
 }
 
 /// List every link in the store.

@@ -1207,3 +1207,61 @@ async fn owner_browsing_does_not_bind_roots_or_allow_members_to_browse() {
         Some(serde_json::json!({"workspace_id":"ws", "path":temp.path().join("missing")}));
     assert!(state.dispatch(&frame, &frames).await.is_err());
 }
+
+#[test]
+fn shared_native_settings_are_generation_fenced_and_durably_dangerous() {
+    let home = tempfile::tempdir().unwrap();
+    crate::rc::with_agit_home(home.path(), || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                use crate::protocol::PermissionMode;
+                let (tx, _rx) = mpsc::channel(1);
+                let live = rpc_test_live("session-a", 2, tx, PermissionMode::Plan);
+                let mut roster = Roster::default();
+                roster.sessions.insert(
+                    "session-a".into(),
+                    rpc_test_roster_entry("session-a", PermissionMode::Plan),
+                );
+                roster.save().unwrap();
+                let daemon =
+                    rpc_test_daemon([("session-a".into(), live)].into_iter().collect(), roster);
+                let mut state = daemon.lock().await;
+                assert!(
+                    state
+                        .observe_native_settings("session-a", 1, Some(PermissionMode::Bypass))
+                        .is_err()
+                );
+                assert!(!state.sessions["session-a"].info.dangerous);
+                roster::fail_next_saves(1, 1);
+                assert!(
+                    state
+                        .observe_native_settings("session-a", 2, Some(PermissionMode::Bypass))
+                        .is_err()
+                );
+                assert!(state.sessions["session-a"].info.dangerous);
+                state
+                    .observe_native_settings("session-a", 2, Some(PermissionMode::Bypass))
+                    .unwrap();
+                assert!(Roster::load().sessions["session-a"].ever_dangerous);
+                state
+                    .observe_native_settings("session-a", 2, Some(PermissionMode::Plan))
+                    .unwrap();
+                let restored = Roster::load();
+                assert_eq!(
+                    restored.sessions["session-a"].permission_mode,
+                    Some(PermissionMode::Plan)
+                );
+                assert!(restored.sessions["session-a"].ever_dangerous);
+                state.observe_native_settings("session-a", 2, None).unwrap();
+                let unknown = Roster::load();
+                assert_eq!(unknown.sessions["session-a"].permission_mode, None);
+                assert!(unknown.sessions["session-a"].guard_attempts.is_empty());
+                assert!(unknown.sessions["session-a"].ever_dangerous);
+                assert!(!state.sessions["session-a"].ended);
+                assert!(state.sessions["session-a"].pending_mode.is_none());
+            });
+    });
+}

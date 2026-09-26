@@ -6,6 +6,35 @@ Every notable change to agit, the AgentGit CLI, by release. The format follows
 its [GitHub Release](https://github.com/Einsia/agent-git/releases), and the
 `@einsia/agent-git` npm package ships this file.
 
+## [0.2.8] - 2026-09-27
+
+### Added
+
+- Discover conversations in registered Codex runtime homes independently of RC
+  attachment. `agit rc sources add` accepts custom directory names and selected
+  executables or endpoints. Same-account native processes and recognized profiles
+  can enroll their runtime homes automatically.
+- Connect RC and native Codex clients to the same persistent app-server, using
+  its standard socket when supported. Both launch orders preserve one native
+  conversation and keep the service alive after a subscriber disconnects.
+- Persist source-qualified catalog identities and incremental discovery cursors,
+  including reconnect recovery, removals, source health, and missing-index fallback.
+- Retain native parent relationships and internal-conversation provenance for
+  scoped expanded catalog views.
+
+### Fixed
+
+- Queue messages into the existing native conversation and execute them without
+  starting a competing writer. Durable message receipts prevent repeated delivery.
+- Read and update supported native model, reasoning effort, and permission
+  settings through the selected runtime source, preserving its current policy
+  during attachment. Shared approvals reconcile across subscribers.
+- Release acquired private fallback control after 15 minutes without a human
+  instruction only when native background unloading is verified. Running work
+  and transcript observation continue; shared service connections do not expire.
+- Revalidate source, project, caller, and delegated authority across reconnects,
+  control transitions, pending instructions, and approval replies.
+
 ## [0.2.7] - 2026-09-25
 
 ### Fixed

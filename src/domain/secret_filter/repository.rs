@@ -225,11 +225,23 @@ impl<K: KeyStore> RepositoryDictionary<K> {
         native: &str,
         cwd: &Path,
     ) -> crate::Result<ProtectionReport> {
+        self.protect_source_session_jsonl(text, global, runtime, native, native, cwd)
+    }
+
+    pub(crate) fn protect_source_session_jsonl(
+        &self,
+        text: &str,
+        global: &Matcher,
+        runtime: &str,
+        native: &str,
+        instance: &str,
+        cwd: &Path,
+    ) -> crate::Result<ProtectionReport> {
         use crate::domain::secrets::identity::{Evidence, RecordMask, native_session_pointers};
         let repo = self.repo_root.as_ref().map(crate::domain::repo::Repo::at);
         let mut evidence = repo.as_ref().map(|repo| Evidence::new(repo, cwd));
         if let Some(evidence) = &mut evidence {
-            evidence.seed_native(runtime, native)?;
+            evidence.seed_native(runtime, instance)?;
         }
         self.protect_with_masks(text, global, |value| {
             if let Some(evidence) = &mut evidence {

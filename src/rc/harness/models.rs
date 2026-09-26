@@ -106,6 +106,48 @@ pub(crate) async fn codex_goal(cwd: PathBuf, thread: &str) -> crate::Result<Valu
     value
 }
 
+/// A source goal read only connects to an existing service and never loads its thread.
+pub(crate) async fn shared_codex_goal(
+    source: &crate::rc::native_codex::Source,
+    thread: &str,
+) -> crate::Result<Value> {
+    let mut client = source
+        .connect()
+        .await
+        .context("Native goal is unavailable while this source's shared Codex server is offline")?;
+    async fn response(
+        client: &mut crate::rc::native_codex::Client,
+        id: u64,
+    ) -> crate::Result<Value> {
+        while let Some(line) = client.next().await {
+            if let Line::Json(value) = line.line() {
+                if value.get("id") != Some(&json!(id)) {
+                    continue;
+                }
+                ensure!(
+                    value.get("error").is_none(),
+                    "Native goal read failed: {}",
+                    value["error"]
+                );
+                return value
+                    .get("result")
+                    .cloned()
+                    .context("Native goal response is missing");
+            }
+        }
+        anyhow::bail!("Shared Codex connection closed during goal inspection")
+    }
+    let result = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        client.send(&json!({"id":1,"method":"initialize","params":{"clientInfo":{"name":"agentgit_goal","version":"0.1.0"},"capabilities":{"experimentalApi":true}}})).await?;
+        response(&mut client, 1).await?;
+        client.send(&json!({"method":"initialized"})).await?;
+        client.send(&json!({"id":2,"method":"thread/goal/get","params":{"threadId":thread}})).await?;
+        response(&mut client, 2).await
+    }).await.context("Native goal read timed out")?;
+    let _ = client.close().await;
+    result
+}
+
 pub async fn discover(runtime: &str, cwd: PathBuf) -> crate::Result<Value> {
     ensure!(
         cwd.is_dir(),

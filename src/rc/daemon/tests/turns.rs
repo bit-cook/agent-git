@@ -1,5 +1,75 @@
 use super::*;
 
+#[test]
+fn shared_permission_receipts_do_not_reapply_stale_defaults_or_claim_a_stopped_task() {
+    for outcome in [
+        PermissionModeOutcome::SharedApplied {
+            applied: crate::protocol::PermissionApply::NextTurn,
+        },
+        PermissionModeOutcome::SharedUnknown {
+            message: "Native reply missing".into(),
+        },
+    ] {
+        let (completion, reply) = project_permission_mode_outcome(
+            outcome,
+            crate::protocol::PermissionMode::Bypass,
+            None,
+            "unused".into(),
+        );
+        assert!(
+            matches!(completion, SessionRpcCompletion::None),
+            "the durable observation barrier already projected native defaults"
+        );
+        if let Ok(reply) = reply {
+            assert_eq!(reply["native_default"], true);
+            assert_eq!(reply["applied"], "next_turn");
+        }
+    }
+}
+
+#[test]
+fn shared_approval_receipts_distinguish_resolution_from_an_unconfirmed_decision() {
+    let (completion, reply) = project_approval_outcome(
+        ApprovalOutcome::Resolved,
+        "approval".into(),
+        None,
+        DangerAuthorization::NotRequired,
+    )
+    .unwrap();
+    assert_eq!(
+        reply.unwrap(),
+        serde_json::json!({"resolved":true,"decision_confirmed":false})
+    );
+    assert!(matches!(
+        completion,
+        SessionRpcCompletion::Approval {
+            resolved: true,
+            retire_generation: false,
+            fail_closed: false,
+            ..
+        }
+    ));
+    let (completion, reply) = project_approval_outcome(
+        ApprovalOutcome::AwaitingResolution {
+            message: "Still awaiting native resolution".into(),
+        },
+        "approval".into(),
+        None,
+        DangerAuthorization::NotRequired,
+    )
+    .unwrap();
+    assert!(reply.unwrap_err().is(ErrorCode::SessionBusy));
+    assert!(matches!(
+        completion,
+        SessionRpcCompletion::Approval {
+            resolved: false,
+            retire_generation: false,
+            fail_closed: false,
+            ..
+        }
+    ));
+}
+
 /// One session can spend the full receipt window waiting for its
 /// supervisor without pinning the daemon state lock or another session's
 /// command path. This exercises the same prepare/execute split used by the
@@ -574,8 +644,9 @@ fn an_unknown_mode_change_persists_a_stable_plan_floor_before_reply() {
                         1,
                         method::SESSION_PERMISSION_MODE,
                         serde_json::to_value(crate::protocol::SessionPermissionMode {
+                            native_default: false,
                             session_id: "session-a".into(),
-                            mode: PermissionMode::Bypass,
+                            mode: Some(PermissionMode::Bypass),
                             applied: PermissionApply::Immediate,
                             by: Some("old-command".into()),
                         })
@@ -1757,4 +1828,24 @@ async fn runtime_commands_require_owner_and_the_live_session_workspace() {
     }
     frame.caller = Some(claim("owner", "ws-a"));
     assert!(daemon.lock().await.prepare_session_rpc(&frame).is_ok());
+}
+
+#[test]
+fn unknown_shared_turn_receipt_keeps_observation_and_forbids_automatic_resubmission() {
+    let (completion, response) = project_turn_start_outcome(
+        TurnStartOutcome::SharedUnknown {
+            message: "Native acceptance reply missing".into(),
+        },
+        None,
+    );
+    assert!(matches!(completion, SessionRpcCompletion::None));
+    let error = response.unwrap_err();
+    assert_eq!(error.data.as_ref().unwrap()["outcome"], "unknown");
+    assert_eq!(error.data.as_ref().unwrap()["retryable"], false);
+    assert!(
+        error.data.unwrap()["hint"]
+            .as_str()
+            .unwrap()
+            .contains("continues")
+    );
 }

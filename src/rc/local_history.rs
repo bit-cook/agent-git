@@ -37,11 +37,28 @@ fn read_with_roster(
         .as_str()
         .context("Session id is required")?;
     let entry = roster.get(session);
+    let catalog_row = if entry.is_none() && session.starts_with("local-") {
+        Some(
+            super::runtime_catalog::Catalog::open()?
+                .lookup(session)?
+                .context(Failure::Missing)?,
+        )
+    } else {
+        None
+    };
     let runtime = entry
         .map(|e| e.runtime.as_str())
+        .or_else(|| catalog_row.as_ref().map(|row| row.runtime.as_str()))
         .or_else(|| params["runtime"].as_str())
         .context("Runtime is required")?;
-    let native = entry.map(|e| e.thread_id.as_str()).unwrap_or(session);
+    let native = entry
+        .map(|e| e.thread_id.as_str())
+        .or_else(|| {
+            catalog_row
+                .as_ref()
+                .map(|row| row.native_session_id.as_str())
+        })
+        .unwrap_or(session);
     ensure!(
         matches!(runtime, "codex" | "claude-code" | "opencode"),
         Failure::Unsupported
@@ -55,9 +72,179 @@ fn read_with_roster(
     );
     let cwd = entry
         .map(|e| e.cwd.as_str())
+        .or_else(|| catalog_row.as_ref().and_then(|row| row.cwd.to_str()))
         .or_else(|| params["cwd"].as_str())
         .context("Working directory is required")?;
-    snapshot::read(runtime, native, cwd, &params, timings)
+    if catalog_row.is_some() {
+        let roots = super::mirror::Mirror::load().roots(super::endpoint::WORKSPACE);
+        super::policy::require_within(std::path::Path::new(cwd), &roots)?;
+    }
+    let source = entry
+        .and_then(|entry| entry.native_source.clone())
+        .or_else(|| {
+            catalog_row
+                .as_ref()
+                .map(|row| crate::protocol::NativeSourceRef {
+                    source_id: row.source_id.clone(),
+                    generation: row.source_generation,
+                })
+        });
+    let context = source
+        .as_ref()
+        .map(|source| {
+            let registry = super::runtime_sources::Registry::open()?;
+            let context =
+                super::runtime_context::RuntimeContext::resolve(&registry, &source.source_id)?;
+            ensure!(
+                context.source.generation == source.generation,
+                Failure::Changed
+            );
+            ensure!(runtime == "codex", Failure::Unsupported);
+            Ok::<_, anyhow::Error>(context)
+        })
+        .transpose()?;
+    let target = Target {
+        runtime,
+        native,
+        cwd,
+        context,
+        entry,
+    };
+    if target.context.is_some() {
+        target.source_path(native)?;
+    }
+    let result = snapshot::read(&target, &params, timings)?;
+    if let Some(context) = &target.context {
+        context.validate()?;
+    }
+    if catalog_row.is_some() {
+        let roots = super::mirror::Mirror::load().roots(super::endpoint::WORKSPACE);
+        super::policy::require_within(std::path::Path::new(cwd), &roots)?;
+    }
+    Ok(result)
+}
+
+pub(super) fn source_redactor(
+    runtime: &str,
+    native: &str,
+    cwd: &std::path::Path,
+    context: Option<super::runtime_context::RuntimeContext>,
+    entry: Option<&super::roster::Entry>,
+) -> crate::Result<crate::domain::redact::Redactor> {
+    Target {
+        runtime,
+        native,
+        cwd: cwd.to_str().context("Native directory is not UTF-8")?,
+        context,
+        entry,
+    }
+    .redactor()
+}
+
+struct Target<'a> {
+    runtime: &'a str,
+    native: &'a str,
+    cwd: &'a str,
+    context: Option<super::runtime_context::RuntimeContext>,
+    entry: Option<&'a super::roster::Entry>,
+}
+
+impl Target<'_> {
+    fn source_path(&self, native: &str) -> crate::Result<std::path::PathBuf> {
+        let context = self.context.as_ref().context(Failure::Missing)?;
+        let roots =
+            super::policy::CanonicalRoots::from_untrusted([std::path::PathBuf::from(self.cwd)]);
+        let thread = context.locate(native, &roots)?;
+        if native == self.native {
+            ensure!(
+                thread.cwd == std::path::Path::new(self.cwd).canonicalize()?,
+                Failure::Changed
+            );
+        }
+        super::local_goal::validate_header(&thread.transcript, native, &thread.cwd)?;
+        Ok(thread.transcript)
+    }
+
+    fn parent_path(&self, native: &str) -> crate::Result<std::path::PathBuf> {
+        let context = self.context.as_ref().context(Failure::Missing)?;
+        let roots =
+            super::policy::CanonicalRoots::from_untrusted([std::path::PathBuf::from(self.cwd)]);
+        context.history_parent(
+            native,
+            &roots,
+            crate::adapter::native_snapshot::Limits::default(),
+        )
+    }
+
+    fn redactor(&self) -> crate::Result<crate::domain::redact::Redactor> {
+        if self.context.is_none() {
+            return super::protection::for_native(
+                self.runtime,
+                self.native,
+                std::path::Path::new(self.cwd),
+            );
+        }
+        // A source-qualified transcript cannot inherit a bare native ID's repository mappings.
+        let redactor = crate::domain::redact::Redactor::try_this_machine()?.for_device_control();
+        match self.entry.and_then(|entry| {
+            entry
+                .agit_session
+                .as_deref()
+                .zip(entry.expected_agent_id.as_deref())
+        }) {
+            Some((lineage, expected)) => {
+                let lineage = super::lineage::AgitSession::parse(lineage, expected)?;
+                let root = lineage.repo_dir()?;
+                let repo = crate::domain::repo::Repo::open(&root)
+                    .context("History repository is unavailable")?;
+                if self
+                    .entry
+                    .is_some_and(|entry| entry.workspace_id == super::endpoint::WORKSPACE)
+                {
+                    super::local_repository::require(&lineage)?;
+                } else {
+                    let identity = crate::hub::identity::read(&repo)?
+                        .context("History repository identity is unavailable")?;
+                    ensure!(
+                        identity.agent_id == lineage.agent_id(),
+                        "History repository identity changed"
+                    );
+                }
+                Ok(redactor
+                    .with_repository(&root)?
+                    .with_native_context(
+                        self.runtime,
+                        self.native,
+                        std::path::Path::new(self.cwd),
+                        &root,
+                    )
+                    .with_native_source(self.entry.and_then(|entry| entry.native_source.clone())))
+            }
+            None => {
+                let context = self.context.as_ref().context(Failure::Missing)?;
+                let key = context.source.session_ref(self.native);
+                match super::protection::native_repository(
+                    self.runtime,
+                    &key,
+                    std::path::Path::new(self.cwd),
+                )? {
+                    Some(root) => Ok(redactor
+                        .with_repository(&root)?
+                        .with_native_context(
+                            self.runtime,
+                            self.native,
+                            std::path::Path::new(self.cwd),
+                            &root,
+                        )
+                        .with_native_source(Some(crate::protocol::NativeSourceRef {
+                            source_id: context.source.source_id.clone(),
+                            generation: context.source.generation,
+                        }))),
+                    None => Ok(redactor),
+                }
+            }
+        }
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -410,6 +597,137 @@ fn page_file(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn source_history_keeps_parents_pages_and_revocation_in_the_registered_home() {
+        let directory = tempfile::tempdir().unwrap();
+        super::super::with_agit_home(directory.path(), || {
+            let project = directory.path().join("project");
+            std::fs::create_dir(&project).unwrap();
+            let project = project.canonicalize().unwrap();
+            let registry = super::super::runtime_sources::Registry::open().unwrap();
+            let mut roster = super::super::roster::Roster::default();
+            let parent = "00000000-0000-0000-0000-000000000001";
+            let native = "00000000-0000-0000-0000-000000000002";
+            let mut sources = Vec::new();
+            for name in ["alpha", "beta"] {
+                let home = directory.path().join(name);
+                std::fs::create_dir(&home).unwrap();
+                let sessions = home.join("sessions");
+                std::fs::create_dir(&sessions).unwrap();
+                let parent_path = sessions.join(format!("rollout-{parent}.jsonl"));
+                let parent_text = format!(
+                    "{}\n{}\n",
+                    json!({"type":"session_meta","ordinal":0,"payload":{"id":parent,"cwd":project}}),
+                    json!({"type":"response_item","ordinal":1,"payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":format!("{name}-parent")}]}})
+                );
+                std::fs::write(&parent_path, &parent_text).unwrap();
+                let path = home.join("child.jsonl");
+                let mut text = format!(
+                    "{}\n",
+                    json!({"type":"session_meta","payload":{
+                        "id":native,"cwd":project,"history_mode":"paginated",
+                        "history_base":{"thread_id":parent,"end_byte_offset":parent_text.len(),"end_ordinal_exclusive":2}
+                    }})
+                );
+                for index in 0..90 {
+                    text.push_str(&format!(
+                        "{}\n",
+                        json!({"type":"response_item","payload":{
+                            "type":"message","role":"assistant","content":[{"type":"output_text","text":format!("{name}-child-{index}")}]
+                        }})
+                    ));
+                }
+                std::fs::write(&path, text).unwrap();
+                let db = rusqlite::Connection::open(home.join("state_1.sqlite")).unwrap();
+                db.execute_batch("CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT, cwd TEXT, archived INTEGER, first_user_message TEXT, thread_source TEXT, updated_at_ms INTEGER)").unwrap();
+                for (id, path) in [(parent, parent_path), (native, path)] {
+                    db.execute(
+                        "INSERT INTO threads VALUES (?1,?2,?3,0,'question','cli',1)",
+                        rusqlite::params![id, path.to_str(), project.to_str()],
+                    )
+                    .unwrap();
+                }
+                let source = registry.register(&home, None, None, None).unwrap();
+                roster.record(name, serde_json::from_value(json!({
+                    "native_source":{"source_id":source.source_id,"generation":source.generation},
+                    "runtime":"codex","thread_id":native,"cwd":project,"workspace_id":"local-owner"
+                })).unwrap()).unwrap();
+                sources.push(source);
+            }
+            let mut mirror = super::super::mirror::Mirror::default();
+            mirror
+                .bind(super::super::endpoint::WORKSPACE, "project", &project)
+                .unwrap();
+            mirror.save().unwrap();
+            let roots = mirror.roots(super::super::endpoint::WORKSPACE);
+            let catalog = super::super::runtime_catalog::Catalog::open().unwrap();
+            for _ in &sources {
+                catalog.reconcile(&roots).unwrap();
+            }
+            let direct = read_with_roster(json!({"session_id":sources[0].session_ref(native),"runtime":"forged","cwd":"/forged"}), &Default::default(), &mut Timings::default()).unwrap();
+            assert!(direct.to_string().contains("alpha-child"));
+            assert!(!direct.to_string().contains("beta-child"));
+            assert!(read_with_roster(json!({"session_id":sources[1].session_ref(native),"snapshot":direct["snapshot"],"before":direct["before"]}), &Default::default(), &mut Timings::default()).is_err());
+            let first = read_with_roster(
+                json!({"session_id":"alpha"}),
+                &roster,
+                &mut Timings::default(),
+            )
+            .unwrap();
+            assert_eq!(first["has_more"], true);
+            assert!(first.to_string().contains("alpha-child"));
+            assert!(!first.to_string().contains("beta-child"));
+            let mut page = first.clone();
+            let mut earlier = String::new();
+            for _ in 0..4 {
+                if page["has_more"] != true {
+                    break;
+                }
+                page = read_with_roster(json!({"session_id":"alpha","snapshot":page["snapshot"],"before":page["before"]}), &roster, &mut Timings::default()).unwrap();
+                earlier.push_str(&page.to_string());
+            }
+            assert!(earlier.contains("alpha-parent"));
+            assert!(!earlier.contains("beta-parent"));
+            assert_eq!(page["has_more"], false);
+            assert!(read_with_roster(json!({"session_id":"beta","snapshot":first["snapshot"],"before":first["before"]}), &roster, &mut Timings::default()).is_err());
+            let beta = read_with_roster(
+                json!({"session_id":"beta"}),
+                &roster,
+                &mut Timings::default(),
+            )
+            .unwrap();
+            assert!(beta.to_string().contains("beta-child"));
+            registry.remove(&sources[0].source_id).unwrap();
+            assert!(
+                read_with_roster(
+                    json!({"session_id":sources[0].session_ref(native)}),
+                    &Default::default(),
+                    &mut Timings::default()
+                )
+                .is_err()
+            );
+            assert!(read_with_roster(json!({"session_id":"alpha","snapshot":first["snapshot"],"before":first["before"]}), &roster, &mut Timings::default()).is_err());
+            std::fs::write(
+                sources[1]
+                    .home
+                    .join(format!("sessions/rollout-{parent}.jsonl")),
+                format!(
+                    "{}\n",
+                    json!({"type":"session_meta","payload":{"id":"different-thread","cwd":project}})
+                ),
+            )
+            .unwrap();
+            assert!(
+                read_with_roster(
+                    json!({"session_id":"beta"}),
+                    &roster,
+                    &mut Timings::default()
+                )
+                .is_err()
+            );
+        });
+    }
+
     #[test]
     fn conversation_view_preserves_native_pages_and_presentable_records() {
         let directory = tempfile::tempdir().unwrap();

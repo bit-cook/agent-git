@@ -37,6 +37,7 @@
 //! advertised identity: keeping the original hash would hand the hub an offline
 //! oracle for guessing a low-entropy value. See [`projected_object_hash`].
 
+mod background;
 mod landing;
 pub(crate) mod native_records;
 mod settlement_io;
@@ -308,7 +309,12 @@ async fn guarded_output(
     let job = crate::rc::windows_job::Job::new().ok()?;
     #[cfg(windows)]
     crate::rc::windows_job::Job::configure(&mut command);
-    let child = command.spawn().ok()?;
+    let child = command
+        .spawn()
+        .inspect_err(|error| {
+            tracing_note(&format!("could not start settlement subprocess: {error}"))
+        })
+        .ok()?;
 
     #[cfg(windows)]
     let child = {
@@ -647,6 +653,7 @@ struct PreparedTurnStarted {
 
 #[derive(Clone)]
 enum TurnGuardBarrier {
+    NativeSettings { mode: Option<PermissionMode> },
     Ready,
     Observe { confirmation_token: String },
     Confirm { confirmation_token: String },
@@ -657,6 +664,8 @@ enum TurnGuardBarrier {
 pub struct Session {
     pub info: SessionInfo,
     driver: AnyDriver,
+    background_poll_at: tokio::time::Instant,
+    transcript_readable: bool,
     tailer: Option<Tailer>,
     native_records: native_records::NativeRecords,
     redactor: redact::Redactor,
@@ -784,6 +793,13 @@ pub struct Session {
 /// not fight for the same transcript file), and writing it into the roster so it can be revived
 /// by logical id after a restart.
 pub enum SessionNote {
+    /// Shared settings must reach the durable danger ledger before new input is handled.
+    NativeSettings {
+        session_id: String,
+        generation: u64,
+        mode: Option<PermissionMode>,
+        ack: tokio::sync::oneshot::Sender<Result<(), String>>,
+    },
     /// This session finished (the harness exited, the driver hit EOF, or Shutdown arrived).
     ///
     /// The daemon removes it from `sessions` on this note. Without it the row **stays forever**
@@ -947,6 +963,11 @@ pub enum Command {
         guard_attempt: Option<crate::rc::harness::TurnGuardAttempt>,
         reply: Ticket<TurnStartOutcome>,
     },
+    Enqueue {
+        request: crate::rc::native_queue::Request,
+        caller_is_owner: bool,
+        reply: Ticket<serde_json::Value>,
+    },
     Steer {
         message: String,
         attribution: MessageAttribution,
@@ -1000,7 +1021,9 @@ fn accept(c: &Command) -> bool {
     match c {
         Command::ClaudeRestartGuardReady => true,
         Command::InitialTurn { .. } => true,
-        Command::Model { reply, .. } | Command::Runtime { reply, .. } => reply.accept(),
+        Command::Model { reply, .. }
+        | Command::Runtime { reply, .. }
+        | Command::Enqueue { reply, .. } => reply.accept(),
         Command::Turn { reply, .. } => reply.accept(),
         Command::Steer { reply, .. } => reply.accept(),
         Command::Interrupt { reply } => reply.accept(),
@@ -1149,7 +1172,7 @@ impl Session {
     /// caller.
     #[allow(clippy::too_many_arguments)]
     pub async fn launch(
-        info: SessionInfo,
+        mut info: SessionInfo,
         spec: LaunchSpec,
         out: mpsc::Sender<Frame>,
         notes: mpsc::Sender<SessionNote>,
@@ -1171,12 +1194,14 @@ impl Session {
             redactor = redactor
                 .with_repository(&repo)
                 .map_err(crate::rc::harness::proc::LaunchError::not_spawned)?;
-            redactor = redactor.with_native_context(
-                &info.runtime,
-                spec.resume_from.as_deref().unwrap_or(""),
-                &cwd,
-                &repo,
-            );
+            redactor = redactor
+                .with_native_context(
+                    &info.runtime,
+                    spec.resume_from.as_deref().unwrap_or(""),
+                    &cwd,
+                    &repo,
+                )
+                .with_native_source(info.native_source.clone());
         }
         // **Whether this is a new run or a continuation is known at this moment.**
         //
@@ -1191,18 +1216,80 @@ impl Session {
         // launch.
         let resuming = spec.resume_from.is_some();
         let launching = std::time::Instant::now();
-        let mut driver = AnyDriver::launch(&info.runtime, spec).await?;
+        let source_context = info
+            .native_source
+            .as_ref()
+            .map(|source| {
+                let registry = crate::rc::runtime_sources::Registry::open()?;
+                let context = crate::rc::runtime_context::RuntimeContext::resolve(
+                    &registry,
+                    &source.source_id,
+                )?;
+                anyhow::ensure!(
+                    info.runtime == "codex" && context.source.generation == source.generation,
+                    "native source changed before attachment"
+                );
+                Ok::<_, anyhow::Error>(context)
+            })
+            .transpose()
+            .map_err(crate::rc::harness::proc::LaunchError::not_spawned)?;
+        let mut driver = match &source_context {
+            Some(context) => {
+                let source = context
+                    .source
+                    .native()
+                    .map_err(crate::rc::harness::proc::LaunchError::not_spawned)?;
+                AnyDriver::Codex(Box::new(
+                    crate::rc::harness::codex::CodexDriver::launch_shared(spec, &source).await?,
+                ))
+            }
+            None => AnyDriver::launch(&info.runtime, spec).await?,
+        };
         trace_phase(&info.session_id, "native.launch", launching);
         if let AnyDriver::Codex(codex) = &mut driver {
             let opening = std::time::Instant::now();
             codex.confirm_opening().await?;
             trace_phase(&info.session_id, "native.opening", opening);
         }
+        if let Some(context) = &source_context {
+            let validation = (|| -> crate::Result<()> {
+                context.validate()?;
+                anyhow::ensure!(
+                    info.dangerous
+                        || (driver.permission_mode_known()
+                            && driver.permission_mode() != crate::protocol::PermissionMode::Bypass),
+                    "native permissions changed during attachment; refresh the session before driving"
+                );
+                let roots = confinement.borrow().roots.clone();
+                let native = driver
+                    .runtime_thread_id()
+                    .ok_or_else(|| anyhow::anyhow!("native attachment has no thread"))?;
+                let thread = context.locate(&native, &roots)?;
+                anyhow::ensure!(
+                    thread.cwd == cwd,
+                    "native conversation directory changed during attachment"
+                );
+                crate::rc::local_goal::validate_header(&thread.transcript, &native, &cwd)
+            })();
+            if let Err(error) = validation {
+                let _ = driver.shutdown().await;
+                return Err(crate::rc::harness::proc::LaunchError::spawned(error));
+            }
+        }
+        info.permission_mode = driver
+            .permission_mode_known()
+            .then(|| driver.permission_mode());
+        info.dangerous |= info.permission_mode.is_none_or(|mode| mode.is_dangerous());
+        if driver.has_active_turn() {
+            info.status = SessionStatus::Running;
+        }
         let mut s = Session {
             agit_session,
             cwd,
             info,
             driver,
+            background_poll_at: tokio::time::Instant::now(),
+            transcript_readable: false,
             tailer: None,
             native_records: native_records::NativeRecords::default(),
             redactor,
@@ -1309,6 +1396,9 @@ impl Session {
     /// Broadcast the driver's current mode if it has drifted from what viewers
     /// were last told. Cheap enough to call after anything that might move it.
     async fn announce_mode(&mut self, by: Option<String>) {
+        if !self.driver.permission_mode_known() {
+            return;
+        }
         let now = self.driver.permission_mode();
         if self.info.permission_mode == Some(now) {
             return;
@@ -1317,8 +1407,9 @@ impl Session {
         self.emit(
             method::SESSION_PERMISSION_MODE,
             SessionPermissionMode {
+                native_default: false,
                 session_id: self.info.session_id.clone(),
-                mode: now,
+                mode: Some(now),
                 applied: PermissionApply::Immediate,
                 by,
             },
@@ -1359,6 +1450,12 @@ impl Session {
         loop {
             let (ack, receipt) = tokio::sync::oneshot::channel();
             let note = match barrier.clone() {
+                TurnGuardBarrier::NativeSettings { mode } => SessionNote::NativeSettings {
+                    session_id: self.info.session_id.clone(),
+                    generation: self.generation,
+                    mode,
+                    ack,
+                },
                 TurnGuardBarrier::Ready => SessionNote::RestartGuardReady {
                     session_id: self.info.session_id.clone(),
                     generation: self.generation,
@@ -1516,6 +1613,18 @@ impl Session {
                 .await;
             }
         }
+        if self.driver.shared_executor()
+            && !native_tree_already_terminated
+            && pending.guard_attempt.is_none()
+            && let TurnStartOutcome::Unknown {
+                message,
+                attempted_mode: None,
+            } = &outcome
+        {
+            outcome = TurnStartOutcome::SharedUnknown {
+                message: message.clone(),
+            };
+        }
         let ends_session = matches!(
             &outcome,
             TurnStartOutcome::Unknown { .. } | TurnStartOutcome::FatalNotAccepted { .. }
@@ -1534,7 +1643,8 @@ impl Session {
                 ));
             }
             TurnStartOutcome::RetryableNotAccepted { .. }
-            | TurnStartOutcome::ConcurrentNotAccepted { .. } => {}
+            | TurnStartOutcome::ConcurrentNotAccepted { .. }
+            | TurnStartOutcome::SharedUnknown { .. } => {}
             TurnStartOutcome::FatalNotAccepted { message } => {
                 // Request-id exhaustion is known to precede native I/O, but
                 // this generation can never allocate another unique id. Retire
@@ -1957,6 +2067,11 @@ impl Session {
                         }
                         other => other,
                     };
+                    if let Some(command) = &cmd
+                        && let Err(error) = self.prepare_fallback_instruction(command).await {
+                            self.reject_fallback_instruction(cmd.expect("command was checked"), error).await;
+                            continue;
+                        }
                     match cmd {
                         None | Some(Command::Shutdown) => {
                             self.abandon_pending_approvals();
@@ -2264,7 +2379,11 @@ impl Session {
                                 _ => {}
                             }
                             match &outcome {
-                                ApprovalOutcome::Applied { .. } => {
+                                ApprovalOutcome::Applied { .. } | ApprovalOutcome::Resolved => {
+                                    self.emit(method::APPROVAL_RESOLVED, crate::protocol::ApprovalResolved {
+                                        session_id: self.info.session_id.clone(),
+                                        approval_id: response.approval_id.clone(),
+                                    }).await;
                                     if self.pending.is_empty() {
                                         self.set_status(SessionStatus::Running).await;
                                     }
@@ -2273,6 +2392,9 @@ impl Session {
                                     self.announce_mode(None).await;
                                 }
                                 ApprovalOutcome::ExplicitRefusal { .. } => {}
+                                ApprovalOutcome::AwaitingResolution { .. } => {
+                                    self.pending.insert(response.approval_id.clone(), pending);
+                                }
                                 ApprovalOutcome::Unknown { message, .. } => {
                                     // The same native write may already have
                                     // installed a sticky policy. Do not expose
@@ -2291,6 +2413,14 @@ impl Session {
                             let result = self.driver.runtime_command(&name, arguments).await.map(|value|self.redactor.scrub_json(&value).value);
                             reply.finish(result);
                         }
+                        Some(Command::Enqueue { request, caller_is_owner, reply }) => {
+                            let result = if self.info.dangerous && !caller_is_owner {
+                                Err(anyhow::anyhow!("native permissions changed; only the owner can queue work in this session"))
+                            } else {
+                                self.driver.enqueue(request).await
+                            };
+                            reply.finish(result);
+                        }
                         Some(Command::Model { model, reply }) => {
                             let result = self.driver.model_control(model.as_ref()).await;
                             if model.is_some() {
@@ -2306,6 +2436,7 @@ impl Session {
                             armed,
                             reply,
                         }) => {
+                            let shared = self.driver.shared_executor();
                             let r = self.driver.set_permission_mode(mode).await;
                             if let Some(note) = danger_disarm_after_mode_result(
                                 &self.info.session_id,
@@ -2317,24 +2448,39 @@ impl Session {
                             }
                             let outcome = match r {
                                 Ok(applied) => {
+                                    if shared {
+                                        self.sync_turn_guard(TurnGuardBarrier::NativeSettings { mode: Some(mode) }).await;
+                                    }
                                     self.info.permission_mode =
                                         Some(self.driver.permission_mode());
                                     self.emit(
                                         method::SESSION_PERMISSION_MODE,
                                         SessionPermissionMode {
+                                            native_default: shared,
                                             session_id: self.info.session_id.clone(),
-                                            mode,
+                                            mode: Some(mode),
                                             applied,
                                             by,
                                         },
                                     )
                                     .await;
-                                    PermissionModeOutcome::Applied { applied }
+                                    if shared { PermissionModeOutcome::SharedApplied { applied } }
+                                    else { PermissionModeOutcome::Applied { applied } }
                                 }
                                 Err(error) if error.is_explicit_refusal() => {
                                     PermissionModeOutcome::ExplicitRefusal {
                                         message: error.to_string(),
                                     }
+                                }
+                                Err(error) if shared => {
+                                    self.sync_turn_guard(TurnGuardBarrier::NativeSettings { mode: None }).await;
+                                    self.info.permission_mode = None;
+                                    self.info.dangerous = true;
+                                    self.emit(method::SESSION_PERMISSION_MODE, SessionPermissionMode {
+                                        session_id: self.info.session_id.clone(), mode: None,
+                                        native_default: true, applied: crate::protocol::PermissionApply::Immediate, by,
+                                    }).await;
+                                    PermissionModeOutcome::SharedUnknown { message: error.to_string() }
                                 }
                                 Err(error) => {
                                     let message = format!(
@@ -2421,6 +2567,7 @@ impl Session {
                             self.tailer = Some(Tailer::new(p, !self.resuming));
                         }
                     self.drain_transcript().await;
+                    self.poll_fallback_control().await;
                 }
             }
         }
@@ -2478,6 +2625,28 @@ impl Session {
     ) -> Option<Option<Command>> {
         let mut deferred_command = None;
         match ev {
+            HarnessEvent::SettingsUpdated { mode, applied } => {
+                self.sync_turn_guard(TurnGuardBarrier::NativeSettings { mode })
+                    .await;
+                self.info.permission_mode = mode;
+                self.info.dangerous |= mode.is_none_or(|mode| mode.is_dangerous());
+                self.emit(
+                    method::SESSION_PERMISSION_MODE,
+                    SessionPermissionMode {
+                        native_default: true,
+                        session_id: self.info.session_id.clone(),
+                        mode,
+                        applied,
+                        by: None,
+                    },
+                )
+                .await;
+                self.emit(
+                    method::SESSION_MODEL,
+                    serde_json::json!({"session_id":self.info.session_id}),
+                )
+                .await;
+            }
             HarnessEvent::Ready {
                 runtime_thread_id,
                 transcript_path,
@@ -2675,6 +2844,23 @@ impl Session {
                 // **directly** for results it can decide locally, and draining there is
                 // recursing into itself.
                 self.flush_initial_turn_if_ready().await;
+            }
+            HarnessEvent::ApprovalResolved { approval_id } => {
+                if self.pending.remove(&approval_id).is_some() {
+                    self.emit(
+                        method::APPROVAL_RESOLVED,
+                        crate::protocol::ApprovalResolved {
+                            session_id: self.info.session_id.clone(),
+                            approval_id,
+                        },
+                    )
+                    .await;
+                    if self.pending.is_empty()
+                        && self.info.status == SessionStatus::AwaitingApproval
+                    {
+                        self.set_status(SessionStatus::Running).await;
+                    }
+                }
             }
             HarnessEvent::Approval(mut req) => {
                 if let Err(message) = self
@@ -3042,7 +3228,7 @@ impl Session {
                 crate::commands::commit::archive::NATIVE_ENV,
                 serde_json::json!({
                     "runtime": crate::adapter::normalize(&self.info.runtime).map(str::to_owned).unwrap_or_else(|_| self.info.runtime.clone()),
-                    "session_id": thread_id,
+                    "session_id": self.info.native_source.as_ref().map(|source| source.session_ref(&thread_id)).unwrap_or_else(|| thread_id.clone()),
                 })
                 .to_string(),
             );
@@ -3273,7 +3459,16 @@ impl Session {
             return;
         };
         let (mode, lines) = if self.info.runtime == "codex" {
-            let batch = tailer.poll_codex().unwrap_or_default();
+            let batch = match tailer.poll_codex() {
+                Ok(batch) => {
+                    self.transcript_readable = true;
+                    batch
+                }
+                Err(_) => {
+                    self.transcript_readable = false;
+                    return;
+                }
+            };
             self.consumed_bytes = tailer.consumed();
             (batch.mode, batch.lines)
         } else {

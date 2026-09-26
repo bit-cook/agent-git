@@ -63,6 +63,12 @@ impl Daemon {
         // Control socket on a blocking thread: `agit rc status` must work even
         // if the async side is wedged talking to an unreachable hub.
         let ctl = control::listen()?;
+        if let Err(error) = crate::rc::runtime_sources::Registry::open()
+            .and_then(|registry| registry.enroll_default())
+        {
+            eprintln!("agitd: default runtime source is unavailable: {error}");
+        }
+        let _catalog_worker = crate::rc::runtime_catalog::Worker::start();
         // Unix publication and lifetime ownership belong to the listener. Its worker retains
         // the lock until process exit; no shutdown unlink can erase a replacement's state.
         #[cfg(windows)]
@@ -452,6 +458,34 @@ impl Daemon {
                             }
                         }
                         link::LinkEvent::Frame { epoch, frame }
+                            if super::catalog::handles(frame.method()) =>
+                        {
+                            if !connection_epoch_is_current(&settlement_tx, epoch) { continue; }
+                            let Some(id) = frame.id.clone() else { continue };
+                            if session_rpc_tasks.len() >= 32 {
+                                let _ = out_tx.send(Frame::error_response(id, RpcError::new(ErrorCode::SessionBusy, "catalog is busy; retry shortly")));
+                                continue;
+                            }
+                            let prepared = {
+                                let state = d.lock().await;
+                                state.prepare_catalog(&frame)
+                            };
+                            match prepared {
+                                Ok(prepared) => {
+                                    let daemon = d.clone();
+                                    let out = out_tx.clone();
+                                    session_rpc_tasks.spawn(async move {
+                                        let response = match prepared.execute(daemon, *frame, epoch).await {
+                                            Ok(value) => Frame::response(id, value),
+                                            Err(error) => Frame::error_response(id, error),
+                                        };
+                                        let _ = out.send(response);
+                                    });
+                                }
+                                Err(error) => { let _ = out_tx.send(Frame::error_response(id, error)); }
+                            }
+                        }
+                        link::LinkEvent::Frame { epoch, frame }
                             if frame.method() == method::SESSION_LIST =>
                         {
                             if !connection_epoch_is_current(&settlement_tx, epoch) { continue; }
@@ -521,7 +555,12 @@ impl Daemon {
                             }
                         }
                         link::LinkEvent::Frame { epoch, frame }
-                            if frame.method() == method::SESSION_ENQUEUE =>
+                            if frame.method() == method::SESSION_ENQUEUE && {
+                                let state = d.lock().await;
+                                frame.params.as_ref().and_then(|params| params["session_id"].as_str())
+                                    .and_then(|id| state.sessions.get(id))
+                                    .is_none_or(|live| live.info.native_source.is_none())
+                            } =>
                         {
                             if !connection_epoch_is_current(&settlement_tx, epoch) { continue; }
                             let Some(id) = frame.id.clone() else { continue };
@@ -541,16 +580,33 @@ impl Daemon {
                                     session_rpc_tasks.spawn(async move {
                                         let result = async {
                                             let request: crate::rc::native_inbox::Request = frame.params_as()?;
-                                            request.validate().map_err(|error| RpcError::new(ErrorCode::MalformedFrame, error.to_string()))?;
-                                            let local = tokio::task::spawn_blocking(move || snapshot.scan(LocalSessionScan::Locate)
-                                                .into_iter().find(|local| local.runtime_session_id == request.session_id))
-                                                .await.map_err(|_| RpcError::new(ErrorCode::Internal, "native inbox discovery failed"))?;
-                                            let prepared = {
+                                            request.validate_message().map_err(|error| RpcError::new(ErrorCode::MalformedFrame, error.to_string()))?;
+                                            let source_roots = {
                                                 let state = daemon.lock().await;
+                                                state.mirror.roots(&request.workspace_id)
+                                            };
+                                            let (local, source) = tokio::task::spawn_blocking(move || {
+                                                if request.session_id.starts_with("local-") {
+                                                    super::source_watch::SourceWatch::resolve(&request.session_id, &source_roots)
+                                                        .map(|source| (None, source)).map_err(super::source_sessions::unavailable)
+                                                } else {
+                                                    request.validate().map_err(|error| RpcError::new(ErrorCode::MalformedFrame, error.to_string()))?;
+                                                    Ok((snapshot.scan(LocalSessionScan::Locate).into_iter()
+                                                        .find(|local| local.runtime_session_id == request.session_id), None))
+                                                }
+                                            })
+                                                .await.map_err(|_| RpcError::new(ErrorCode::Internal, "native inbox discovery failed"))??;
+                                            let prepared = {
+                                                let mut state = daemon.lock().await;
                                                 if !connection_epoch_is_current(&state.settlement, epoch) {
                                                     return Err(RpcError::new(ErrorCode::SessionBusy, "connection changed before native delivery"));
                                                 }
-                                                state.prepare_native_inbox(&frame, local)?
+                                                let mut prepared = match source {
+                                                    Some(source) => state.prepare_inbox_target(&frame, local, Some(source))?,
+                                                    None => state.prepare_native_inbox(&frame, local)?,
+                                                };
+                                                prepared.confinement = Some(state.confinement_for(&prepared.request.workspace_id));
+                                                prepared
                                             };
                                             prepared.deliver().await.map_err(|error| RpcError::new(ErrorCode::Internal, error.to_string()))
                                         }.await;

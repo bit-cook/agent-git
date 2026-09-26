@@ -60,8 +60,16 @@ pub struct Request {
 impl Request {
     pub fn validate(&self) -> crate::Result<()> {
         ensure!(
-            valid_id(&self.session_id) && valid_id(&self.client_msg_id),
-            "an exact session UUID and client message UUID are required"
+            valid_id(&self.session_id),
+            "an exact native session UUID is required"
+        );
+        self.validate_message()
+    }
+
+    pub fn validate_message(&self) -> crate::Result<()> {
+        ensure!(
+            valid_id(&self.client_msg_id),
+            "a client message UUID is required"
         );
         ensure!(
             !self.message.trim().is_empty() && self.message.len() <= MAX_MESSAGE,
@@ -76,6 +84,10 @@ pub fn valid_id(value: &str) -> bool {
 }
 
 pub struct Prepared {
+    pub(crate) source: Option<super::runtime_context::RuntimeContext>,
+    pub(crate) authority: super::authority::Guard,
+    pub(crate) confinement: Option<tokio::sync::watch::Receiver<super::Confinement>>,
+    pub(crate) allow_dangerous: bool,
     pub request: Request,
     pub transcript: PathBuf,
     pub cwd: PathBuf,
@@ -100,7 +112,7 @@ fn sync_directory(path: &Path) -> crate::Result<()> {
     Ok(())
 }
 
-fn open_regular(path: &Path) -> crate::Result<std::fs::File> {
+pub(super) fn open_regular(path: &Path) -> crate::Result<std::fs::File> {
     let mut options = std::fs::OpenOptions::new();
     options.read(true);
     #[cfg(unix)]
@@ -116,8 +128,11 @@ fn open_regular(path: &Path) -> crate::Result<std::fs::File> {
     Ok(file)
 }
 
-fn verify_transcript(path: &Path, session: &str) -> crate::Result<()> {
-    let file = open_regular(path)?;
+pub(super) fn verify_transcript(path: &Path, session: &str) -> crate::Result<()> {
+    verify_open_transcript(&mut open_regular(path)?, session)
+}
+
+pub(super) fn verify_open_transcript(file: &mut std::fs::File, session: &str) -> crate::Result<()> {
     let mut bytes = Vec::new();
     file.take(128 * 1024).read_to_end(&mut bytes)?;
     let header = bytes
@@ -133,8 +148,43 @@ fn verify_transcript(path: &Path, session: &str) -> crate::Result<()> {
 }
 
 impl Prepared {
+    fn validate_source(&self) -> crate::Result<()> {
+        self.authority
+            .check()
+            .map_err(|error| anyhow::anyhow!(error.message))?;
+        if let Some(confinement) = &self.confinement {
+            ensure!(
+                confinement.has_changed().is_ok(),
+                "workspace authority is unavailable"
+            );
+            super::policy::require_within(&self.cwd, &confinement.borrow().roots)?;
+        }
+        if let Some(context) = &self.source {
+            let roots = super::policy::CanonicalRoots::from_untrusted([self.cwd.clone()]);
+            let thread = context.locate(&self.request.session_id, &roots)?;
+            ensure!(
+                thread.cwd == self.cwd && thread.transcript == self.transcript,
+                "native inbox source changed before delivery"
+            );
+            if !self.allow_dangerous {
+                let mode = context.settings(&thread)?.permission_mode;
+                ensure!(
+                    mode.is_some() && mode != Some(crate::protocol::PermissionMode::Bypass),
+                    "native permissions changed; only the owner can queue work in this session"
+                );
+            }
+            super::local_goal::validate_header(
+                &thread.transcript,
+                &self.request.session_id,
+                &self.cwd,
+            )?;
+        }
+        Ok(())
+    }
+
     pub async fn deliver(self) -> crate::Result<Value> {
         self.request.validate()?;
+        self.validate_source()?;
         verify_transcript(&self.transcript, &self.request.session_id)?;
         std::fs::create_dir_all(&self.receipts)?;
         ensure!(
@@ -154,13 +204,25 @@ impl Prepared {
         if let Some(parent) = self.receipts.parent() {
             sync_directory(parent)?;
         }
-        let scope = serde_json::to_vec(&(
-            &self.hub,
-            &self.request.workspace_id,
-            &self.request.session_id,
-            &self.account,
-            &self.request.client_msg_id,
-        ))?;
+        let scope = if let Some(context) = &self.source {
+            serde_json::to_vec(&(
+                "source-native-inbox-v1",
+                &self.hub,
+                &self.request.workspace_id,
+                &context.source.source_id,
+                &self.request.session_id,
+                &self.account,
+                &self.request.client_msg_id,
+            ))?
+        } else {
+            serde_json::to_vec(&(
+                &self.hub,
+                &self.request.workspace_id,
+                &self.request.session_id,
+                &self.account,
+                &self.request.client_msg_id,
+            ))?
+        };
         let key = hex::encode(Sha256::digest(scope));
         let path = self.receipts.join(format!("{key}.json"));
         let digest = hex::encode(Sha256::digest(self.request.message.as_bytes()));
@@ -184,6 +246,7 @@ impl Prepared {
             queue_available(self.codex.clone()).await,
             "Codex native queue is unavailable"
         );
+        self.validate_source()?;
         let mut options = std::fs::OpenOptions::new();
         options.write(true).create_new(true);
         #[cfg(unix)]
@@ -215,7 +278,7 @@ impl Prepared {
             }
             Err(error) => return Err(error.into()),
         }
-        let message = self.username.map_or_else(
+        let message = self.username.as_ref().map_or_else(
             || self.request.message.clone(),
             |username| {
                 format!(
@@ -224,22 +287,40 @@ impl Prepared {
                 )
             },
         );
-        let mut child =
-            tokio::process::Command::from(crate::infra::background::command(&self.codex))
-                .args([
-                    "queue",
-                    "--thread",
-                    &self.request.session_id,
-                    "--message",
-                    &message,
-                ])
-                .current_dir(&self.cwd)
-                .stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .kill_on_drop(true)
-                .spawn()
-                .context("could not start the native Codex inbox; delivery is unknown")?;
+        let mut command =
+            tokio::process::Command::from(crate::infra::background::command(&self.codex));
+        command
+            .args([
+                "queue",
+                "--thread",
+                &self.request.session_id,
+                "--message",
+                &message,
+            ])
+            .current_dir(&self.cwd)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true);
+        if let Some(context) = &self.source {
+            command.env("CODEX_HOME", &context.source.home);
+        }
+        self.validate_source()?;
+        let mut child = {
+            let confinement = self.confinement.as_ref().map(|receiver| receiver.borrow());
+            if let Some(confinement) = &confinement {
+                super::policy::require_within(&self.cwd, &confinement.roots)?;
+            }
+            let mut spawned = None;
+            let admitted = self.authority.admit(|| {
+                spawned = Some(command.spawn());
+                true
+            });
+            ensure!(admitted, "request authority expired before native delivery");
+            spawned
+                .expect("accepted native delivery attempts process creation")
+                .context("could not start the native Codex inbox; delivery is unknown")?
+        };
         let status = tokio::time::timeout(Duration::from_secs(15), child.wait())
             .await
             .context(
@@ -267,6 +348,10 @@ mod tests {
 
     fn prepared(root: &Path, session: &str, client_id: &str) -> Prepared {
         Prepared {
+            source: None,
+            authority: Default::default(),
+            confinement: None,
+            allow_dangerous: true,
             request: Request {
                 workspace_id: "workspace".into(),
                 session_id: session.into(),
@@ -296,6 +381,95 @@ mod tests {
         value.request.session_id = uuid::Uuid::new_v4().to_string();
         value.request.message = "x".repeat(MAX_MESSAGE + 1);
         assert!(value.request.validate().is_err());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn copied_threads_queue_in_their_enrolled_home_and_revocation_prevents_delivery() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let project = root.path().join("project");
+        std::fs::create_dir(&project).unwrap();
+        let project = project.canonicalize().unwrap();
+        let executable = root.path().join("codex");
+        std::fs::write(&executable,
+            "#!/bin/sh\nif [ \"$2\" = --help ]; then echo --thread --message; exit 0; fi\nprintf '%s\n' \"$@\" >> \"$CODEX_HOME/calls\"\n").unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let registry =
+            super::super::runtime_sources::Registry::at(root.path().join("registry")).unwrap();
+        let native = uuid::Uuid::new_v4().to_string();
+        let client = uuid::Uuid::new_v4().to_string();
+        let mut contexts = Vec::new();
+        for name in ["profile-a", "profile-b"] {
+            let home = root.path().join(name);
+            std::fs::create_dir(&home).unwrap();
+            let home = home.canonicalize().unwrap();
+            let transcript = home.join("history.jsonl");
+            std::fs::write(
+                &transcript,
+                format!(
+                    "{}\n",
+                    json!({"type":"session_meta","payload":{"id":native,"cwd":project}})
+                ),
+            )
+            .unwrap();
+            let db = rusqlite::Connection::open(home.join("state_1.sqlite")).unwrap();
+            db.execute_batch("CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT, cwd TEXT, first_user_message TEXT, thread_source TEXT, updated_at_ms INTEGER, archived INTEGER)").unwrap();
+            db.execute(
+                "INSERT INTO threads VALUES (?1,?2,?3,'Preview','cli',1,0)",
+                rusqlite::params![native, transcript.to_str(), project.to_str()],
+            )
+            .unwrap();
+            let source = registry
+                .register(&home, Some(&executable), None, None)
+                .unwrap();
+            contexts.push(
+                super::super::runtime_context::RuntimeContext::resolve(
+                    &registry,
+                    &source.source_id,
+                )
+                .unwrap(),
+            );
+        }
+        let request = |context: &super::super::runtime_context::RuntimeContext| {
+            let mut request = prepared(root.path(), &native, &client);
+            request.cwd = project.clone();
+            request.transcript = context.source.home.join("history.jsonl");
+            request.source = Some(context.clone());
+            request
+        };
+        for context in &contexts {
+            assert_eq!(
+                request(context).deliver().await.unwrap()["status"],
+                "queued"
+            );
+            assert_eq!(
+                request(context).deliver().await.unwrap()["status"],
+                "queued"
+            );
+            let calls = std::fs::read_to_string(context.source.home.join("calls")).unwrap();
+            assert_eq!(calls.matches("--thread").count(), 1);
+            assert!(calls.contains(&native));
+        }
+        let mut uncertain_policy = request(&contexts[1]);
+        uncertain_policy.allow_dangerous = false;
+        uncertain_policy.request.client_msg_id = uuid::Uuid::new_v4().to_string();
+        assert!(uncertain_policy.deliver().await.is_err());
+        let (binding, current) = tokio::sync::watch::channel(super::super::Confinement {
+            roots: super::super::policy::CanonicalRoots::from_untrusted([project.clone()]),
+            ..Default::default()
+        });
+        let mut unbound = request(&contexts[1]);
+        unbound.confinement = Some(current);
+        binding.send_replace(Default::default());
+        assert!(unbound.deliver().await.is_err());
+        let removed = request(&contexts[0]);
+        registry.remove(&contexts[0].source.source_id).unwrap();
+        assert!(removed.deliver().await.is_err());
+        assert_eq!(
+            request(&contexts[1]).deliver().await.unwrap()["status"],
+            "queued"
+        );
     }
 
     #[cfg(unix)]

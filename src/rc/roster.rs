@@ -48,6 +48,8 @@ pub struct GuardAttempt {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Entry {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_source: Option<crate::protocol::NativeSourceRef>,
     pub runtime: String,
     /// The harness-native session/thread id (`claude --resume` takes this).
     pub thread_id: String,
@@ -501,8 +503,13 @@ impl Roster {
     }
 
     /// Record one row. **The old thread id is not lost** — it moves into `prior_threads`.
-    pub fn record(&mut self, logical_id: &str, mut entry: Entry) {
+    pub fn record(&mut self, logical_id: &str, mut entry: Entry) -> crate::Result<()> {
         if let Some(old) = self.sessions.get(logical_id) {
+            anyhow::ensure!(
+                old.native_source.as_ref().map(|source| &source.source_id)
+                    == entry.native_source.as_ref().map(|source| &source.source_id),
+                "a logical session cannot change its native source"
+            );
             entry.prior_threads = old.prior_threads.clone();
             if old.thread_id != entry.thread_id && !old.thread_id.is_empty() {
                 entry.prior_threads.push(old.thread_id.clone());
@@ -512,6 +519,7 @@ impl Roster {
             entry.guard_attempts.extend(old.guard_attempts.clone());
         }
         self.sessions.insert(logical_id.to_string(), entry);
+        Ok(())
     }
 
     pub fn get(&self, logical_id: &str) -> Option<&Entry> {
@@ -593,10 +601,24 @@ impl Roster {
         thread_id: &str,
         workspace_id: &str,
     ) -> Option<String> {
+        self.logical_for_thread_in(runtime, None, thread_id, workspace_id)
+    }
+
+    pub fn logical_for_thread_in(
+        &self,
+        runtime: &str,
+        source_id: Option<&str>,
+        thread_id: &str,
+        workspace_id: &str,
+    ) -> Option<String> {
         self.sessions
             .iter()
             .find(|(_, e)| {
                 e.runtime == runtime
+                    && e.native_source
+                        .as_ref()
+                        .map(|source| source.source_id.as_str())
+                        == source_id
                     && e.workspace_id == workspace_id
                     && (e.thread_id == thread_id
                         // Accept old ids: after Claude Code rotates its session id, the
@@ -656,12 +678,17 @@ impl Roster {
     fn thread_ever_dangerous_here(
         &self,
         runtime: &str,
+        source_id: Option<&str>,
         thread_id: &str,
         workspace_id: &str,
         cwd: &str,
     ) -> bool {
         self.sessions.values().any(|e| {
             e.ever_dangerous
+                && e.native_source
+                    .as_ref()
+                    .map(|source| source.source_id.as_str())
+                    == source_id
                 && e.runtime == runtime
                 && (e.workspace_id == workspace_id || e.cwd == cwd)
                 && (e.thread_id == thread_id || e.prior_threads.iter().any(|t| t == thread_id))
@@ -689,9 +716,19 @@ impl Roster {
     /// orphan transcript in its own listing. So same workspace **or** same cwd
     /// both count — let either side through and the monotonic danger bit is
     /// washed clean on the other.
-    fn dangerous_start_unaccounted(&self, runtime: &str, workspace_id: &str, cwd: &str) -> bool {
+    fn dangerous_start_unaccounted(
+        &self,
+        runtime: &str,
+        source_id: Option<&str>,
+        workspace_id: &str,
+        cwd: &str,
+    ) -> bool {
         self.sessions.iter().any(|(logical_id, e)| {
             e.ever_dangerous
+                && e.native_source
+                    .as_ref()
+                    .map(|source| source.source_id.as_str())
+                    == source_id
                 && (e.thread_id.is_empty()
                     || self.unconfirmed_dangerous_bindings.contains(logical_id))
                 && e.runtime == runtime
@@ -742,13 +779,27 @@ impl Roster {
         workspace_id: &str,
         cwd: &str,
     ) -> bool {
-        self.thread_ever_dangerous_here(runtime, thread_id, workspace_id, cwd)
+        self.transcript_ever_dangerous_in(runtime, None, thread_id, workspace_id, cwd)
+    }
+
+    pub fn transcript_ever_dangerous_in(
+        &self,
+        runtime: &str,
+        source_id: Option<&str>,
+        thread_id: &str,
+        workspace_id: &str,
+        cwd: &str,
+    ) -> bool {
+        self.thread_ever_dangerous_here(runtime, source_id, thread_id, workspace_id, cwd)
             || self
-                .logical_for_thread(runtime, thread_id, workspace_id)
+                .logical_for_thread_in(runtime, source_id, thread_id, workspace_id)
                 .map(|logical| self.ever_dangerous(&logical))
                 .unwrap_or_else(|| {
-                    self.ever_dangerous(thread_id)
-                        || self.dangerous_start_unaccounted(runtime, workspace_id, cwd)
+                    (if source_id.is_none() {
+                        self.ever_dangerous(thread_id)
+                    } else {
+                        self.history_lost
+                    }) || self.dangerous_start_unaccounted(runtime, source_id, workspace_id, cwd)
                 })
     }
 }
@@ -812,6 +863,7 @@ mod tests {
     fn two_workspaces_sharing_a_folder_each_resolve_to_their_own_row() {
         let mut r = Roster::default();
         let base = Entry {
+            native_source: None,
             runtime: "claude-code".into(),
             thread_id: "t1".into(),
             cwd: "/srv/app".into(),
@@ -825,7 +877,7 @@ mod tests {
             prior_threads: vec![],
         };
         // `agit-a` sorts first by key, so without the workspace test it is always found first.
-        r.record("agit-a", base.clone());
+        r.record("agit-a", base.clone()).unwrap();
         r.record(
             "agit-b",
             Entry {
@@ -834,7 +886,8 @@ mod tests {
                 ever_dangerous: true,
                 ..base
             },
-        );
+        )
+        .unwrap();
 
         assert_eq!(
             r.logical_for_thread("claude-code", "t1", "ws-a").as_deref(),
@@ -856,6 +909,7 @@ mod tests {
     fn an_unbound_dangerous_start_poisons_its_runtime_workspace_and_directory() {
         let mut r = Roster::default();
         let unbound = Entry {
+            native_source: None,
             runtime: "codex".into(),
             thread_id: String::new(),
             cwd: "/srv/app".into(),
@@ -868,7 +922,7 @@ mod tests {
             ever_dangerous: true,
             prior_threads: vec![],
         };
-        r.record("agit-crashed", unbound.clone());
+        r.record("agit-crashed", unbound.clone()).unwrap();
         // A clean unbound row poisons nothing: only a danger bit in play is worth narrowing
         // adoption to owner-only.
         r.record(
@@ -878,16 +932,17 @@ mod tests {
                 ever_dangerous: false,
                 ..unbound.clone()
             },
-        );
+        )
+        .unwrap();
 
-        assert!(r.dangerous_start_unaccounted("codex", "ws-a", "/other"));
-        assert!(!r.dangerous_start_unaccounted("codex", "ws-b", "/other"));
-        assert!(!r.dangerous_start_unaccounted("claude-code", "ws-a", "/other"));
+        assert!(r.dangerous_start_unaccounted("codex", None, "ws-a", "/other"));
+        assert!(!r.dangerous_start_unaccounted("codex", None, "ws-b", "/other"));
+        assert!(!r.dangerous_start_unaccounted("claude-code", None, "ws-a", "/other"));
         // A second workspace binds the same folder: the orphan transcript is in ws-b's listing,
         // and with the territory drawn by workspace alone one adoption by a ws-b operator washes
         // the monotonic danger bit out.
         assert!(
-            r.dangerous_start_unaccounted("codex", "ws-b", "/srv/app"),
+            r.dangerous_start_unaccounted("codex", None, "ws-b", "/srv/app"),
             "the other workspace on a shared folder also sees this orphan transcript"
         );
 
@@ -899,8 +954,9 @@ mod tests {
                 thread_id: "native-9".into(),
                 ..unbound
             },
-        );
-        assert!(!r.dangerous_start_unaccounted("codex", "ws-a", "/srv/app"));
+        )
+        .unwrap();
+        assert!(!r.dangerous_start_unaccounted("codex", None, "ws-a", "/srv/app"));
         assert!(r.ever_dangerous("agit-crashed"));
     }
 
@@ -926,6 +982,7 @@ mod tests {
         r.record(
             "agit-a",
             Entry {
+                native_source: None,
                 runtime: "claude-code".into(),
                 thread_id: "t1".into(),
                 cwd: "/srv/app".into(),
@@ -940,28 +997,29 @@ mod tests {
                 // disk, carrying the same context.
                 prior_threads: vec!["t0".into()],
             },
-        );
+        )
+        .unwrap();
         // precondition: this row is neither kind of "unknown", so the unbound test cannot
         // match it.
         assert!(r.unconfirmed_dangerous_bindings.is_empty());
-        assert!(!r.dangerous_start_unaccounted("claude-code", "ws-b", "/srv/app"));
+        assert!(!r.dangerous_start_unaccounted("claude-code", None, "ws-b", "/srv/app"));
 
-        assert!(r.thread_ever_dangerous_here("claude-code", "t1", "ws-a", "/srv/app"));
+        assert!(r.thread_ever_dangerous_here("claude-code", None, "t1", "ws-a", "/srv/app"));
         assert!(
-            r.thread_ever_dangerous_here("claude-code", "t1", "ws-b", "/srv/app"),
+            r.thread_ever_dangerous_here("claude-code", None, "t1", "ws-b", "/srv/app"),
             "ws-b binds this folder too, so the dangerous transcript is adoptable from its listing"
         );
         assert!(
-            r.thread_ever_dangerous_here("claude-code", "t0", "ws-b", "/srv/app"),
+            r.thread_ever_dangerous_here("claude-code", None, "t0", "ws-b", "/srv/app"),
             "a rotated-away thread id points at the same context"
         );
 
         // Outside the territory it is someone else's tenancy: another folder, another runtime,
         // another thread is not implicated, or this test would lock unrelated adoptions into
         // owner-only too.
-        assert!(!r.thread_ever_dangerous_here("claude-code", "t1", "ws-b", "/srv/other"));
-        assert!(!r.thread_ever_dangerous_here("codex", "t1", "ws-b", "/srv/app"));
-        assert!(!r.thread_ever_dangerous_here("claude-code", "t9", "ws-a", "/srv/app"));
+        assert!(!r.thread_ever_dangerous_here("claude-code", None, "t1", "ws-b", "/srv/other"));
+        assert!(!r.thread_ever_dangerous_here("codex", None, "t1", "ws-b", "/srv/app"));
+        assert!(!r.thread_ever_dangerous_here("claude-code", None, "t9", "ws-a", "/srv/app"));
     }
 
     /// The half where the harness **has rotated** the thread id: the ledger's id
@@ -973,6 +1031,7 @@ mod tests {
         r.record(
             "agit-x",
             Entry {
+                native_source: None,
                 runtime: "claude-code".into(),
                 // Non-empty: a genuine id, the one in use until slow-path recovery.
                 thread_id: "t-old".into(),
@@ -986,9 +1045,10 @@ mod tests {
                 ever_dangerous: true,
                 prior_threads: vec![],
             },
-        );
+        )
+        .unwrap();
         assert!(
-            !r.dangerous_start_unaccounted("claude-code", "ws-a", "/srv/app"),
+            !r.dangerous_start_unaccounted("claude-code", None, "ws-a", "/srv/app"),
             "a confirmed binding poisons no one: the ledger knows every id it has"
         );
 
@@ -998,7 +1058,7 @@ mod tests {
             "re-arming is not a new record"
         );
         assert!(
-            r.dangerous_start_unaccounted("claude-code", "ws-a", "/srv/app"),
+            r.dangerous_start_unaccounted("claude-code", None, "ws-a", "/srv/app"),
             "t-old may already be rotated away and the ledger does not know the new one"
         );
         // The old id itself is judged normally: it is right there on this row.
@@ -1006,7 +1066,7 @@ mod tests {
 
         assert!(r.confirm_binding("agit-x"));
         assert!(!r.confirm_binding("agit-x"));
-        assert!(!r.dangerous_start_unaccounted("claude-code", "ws-a", "/srv/app"));
+        assert!(!r.dangerous_start_unaccounted("claude-code", None, "ws-a", "/srv/app"));
     }
 
     /// The poison bit goes **into the file**. It describes exactly that this
@@ -1019,6 +1079,7 @@ mod tests {
         r.record(
             "agit-x",
             Entry {
+                native_source: None,
                 runtime: "claude-code".into(),
                 thread_id: "t-old".into(),
                 cwd: "/srv/app".into(),
@@ -1031,10 +1092,11 @@ mod tests {
                 ever_dangerous: true,
                 prior_threads: vec![],
             },
-        );
+        )
+        .unwrap();
         r.arm_unconfirmed_binding("agit-x");
         let reloaded: Roster = serde_json::from_str(&serde_json::to_string(&r).unwrap()).unwrap();
-        assert!(reloaded.dangerous_start_unaccounted("claude-code", "ws-a", "/srv/app"));
+        assert!(reloaded.dangerous_start_unaccounted("claude-code", None, "ws-a", "/srv/app"));
     }
 
     /// Once the ledger has been corrupt, **a restart must not forget that fact**.
@@ -1061,22 +1123,25 @@ mod tests {
 
             // Sessions recorded after the loss are judged normally — one corruption must not
             // degrade this machine forever.
-            after.record(
-                "s-new",
-                Entry {
-                    runtime: "claude-code".into(),
-                    thread_id: "t-new".into(),
-                    cwd: "/tmp".into(),
-                    workspace_id: "ws-1".into(),
-                    project_id: None,
-                    agit_session: None,
-                    expected_agent_id: None,
-                    permission_mode: None,
-                    guard_attempts: Default::default(),
-                    prior_threads: vec![],
-                    ever_dangerous: false,
-                },
-            );
+            after
+                .record(
+                    "s-new",
+                    Entry {
+                        native_source: None,
+                        runtime: "claude-code".into(),
+                        thread_id: "t-new".into(),
+                        cwd: "/tmp".into(),
+                        workspace_id: "ws-1".into(),
+                        project_id: None,
+                        agit_session: None,
+                        expected_agent_id: None,
+                        permission_mode: None,
+                        guard_attempts: Default::default(),
+                        prior_threads: vec![],
+                        ever_dangerous: false,
+                    },
+                )
+                .unwrap();
             assert!(!after.ever_dangerous("s-new"));
             // And the ids the ledger cannot find (the lost batch) stay closed.
             assert!(after.ever_dangerous("s-from-before-the-loss"));
@@ -1195,6 +1260,7 @@ mod tests {
         r.record(
             "agit-abc",
             Entry {
+                native_source: None,
                 runtime: "claude-code".into(),
                 thread_id: "0192-uuid".into(),
                 cwd: "/w".into(),
@@ -1207,7 +1273,8 @@ mod tests {
                 ever_dangerous: false,
                 prior_threads: vec![],
             },
-        );
+        )
+        .unwrap();
         assert_eq!(
             r.logical_for_thread("claude-code", "0192-uuid", "ws1")
                 .as_deref(),
@@ -1221,6 +1288,7 @@ mod tests {
     fn the_same_thread_can_gain_its_first_immutable_lineage() {
         let mut r = Roster::default();
         let unclaimed = Entry {
+            native_source: None,
             runtime: "codex".into(),
             thread_id: "thread-1".into(),
             cwd: "/w".into(),
@@ -1233,7 +1301,7 @@ mod tests {
             ever_dangerous: false,
             prior_threads: vec![],
         };
-        r.record("agit-1", unclaimed.clone());
+        r.record("agit-1", unclaimed.clone()).unwrap();
         r.record(
             "agit-1",
             Entry {
@@ -1241,7 +1309,8 @@ mod tests {
                 expected_agent_id: Some("00000000-0000-0000-0000-000000000001".into()),
                 ..unclaimed
             },
-        );
+        )
+        .unwrap();
 
         let saved = r.get("agit-1").unwrap();
         assert_eq!(saved.thread_id, "thread-1");
@@ -1264,6 +1333,7 @@ mod tests {
     fn an_old_thread_id_still_resolves_to_the_same_conversation_after_a_rotation() {
         let mut r = Roster::default();
         let base = Entry {
+            native_source: None,
             runtime: "claude-code".into(),
             thread_id: "t1".into(),
             cwd: "/srv/app".into(),
@@ -1276,7 +1346,7 @@ mod tests {
             ever_dangerous: true,
             prior_threads: vec![],
         };
-        r.record("agit-X", base.clone());
+        r.record("agit-X", base.clone()).unwrap();
         // Claude Code rotated the id.
         r.record(
             "agit-X",
@@ -1287,7 +1357,8 @@ mod tests {
                 ever_dangerous: false,
                 ..base
             },
-        );
+        )
+        .unwrap();
 
         assert_eq!(
             r.logical_for_thread("claude-code", "t2", "ws-a").as_deref(),
@@ -1307,6 +1378,7 @@ mod tests {
     fn start_info() -> crate::protocol::SessionInfo {
         crate::protocol::SessionInfo {
             session_id: "agit-started".into(),
+            native_source: None,
             runtime_session_id: None,
             workspace_id: "ws-1".into(),
             project_id: Some("project-1".into()),
@@ -1505,6 +1577,7 @@ mod tests {
     #[test]
     fn every_unresolved_turn_guard_forces_plan_until_the_last_token_is_removed() {
         let mut entry = Entry {
+            native_source: None,
             runtime: "codex".into(),
             thread_id: "thread-1".into(),
             cwd: "/tmp/project".into(),
@@ -1554,6 +1627,7 @@ mod tests {
     fn shutdown_guard_round_trip_is_a_named_live_mode_floor() {
         let token = format!("{}stable-token", SHUTDOWN_GUARD_PREFIX);
         let mut entry = Entry {
+            native_source: None,
             runtime: "codex".into(),
             thread_id: "thread-1".into(),
             cwd: "/tmp/project".into(),
@@ -1595,5 +1669,68 @@ mod tests {
             mode_with_shutdown_floor(&entry.guard_attempts, entry.permission_mode),
             Some(crate::protocol::PermissionMode::Bypass)
         );
+    }
+    #[test]
+    fn source_identity_survives_generations_without_sharing_native_aliases_or_danger() {
+        let mut roster = Roster::default();
+        let base: Entry = serde_json::from_value(serde_json::json!({
+            "runtime":"codex", "thread_id":"same-native", "workspace_id":"workspace", "cwd":"/project"
+        })).unwrap();
+        let mut alpha = base.clone();
+        alpha.native_source = Some(crate::protocol::NativeSourceRef {
+            source_id: "alpha".into(),
+            generation: 1,
+        });
+        alpha.ever_dangerous = true;
+        let mut beta = base.clone();
+        beta.native_source = Some(crate::protocol::NativeSourceRef {
+            source_id: "beta".into(),
+            generation: 1,
+        });
+        roster.record("alpha-ref", alpha.clone()).unwrap();
+        roster.record("beta-ref", beta.clone()).unwrap();
+        roster.record("legacy", base).unwrap();
+        assert_eq!(
+            roster
+                .logical_for_thread("codex", "same-native", "workspace")
+                .as_deref(),
+            Some("legacy")
+        );
+        assert_eq!(
+            roster
+                .logical_for_thread_in("codex", Some("alpha"), "same-native", "workspace")
+                .as_deref(),
+            Some("alpha-ref")
+        );
+        assert_eq!(
+            roster
+                .logical_for_thread_in("codex", Some("beta"), "same-native", "workspace")
+                .as_deref(),
+            Some("beta-ref")
+        );
+        assert!(roster.transcript_ever_dangerous_in(
+            "codex",
+            Some("alpha"),
+            "same-native",
+            "other-workspace",
+            "/project"
+        ));
+        assert!(!roster.transcript_ever_dangerous_in(
+            "codex",
+            Some("beta"),
+            "same-native",
+            "workspace",
+            "/project"
+        ));
+        assert!(!roster.transcript_ever_dangerous("codex", "same-native", "workspace", "/project"));
+        assert!(roster.record("alpha-ref", beta).is_err());
+        alpha.native_source.as_mut().unwrap().generation = 2;
+        alpha.ever_dangerous = false;
+        roster.record("alpha-ref", alpha).unwrap();
+        let restored: Roster =
+            serde_json::from_slice(&serde_json::to_vec(&roster).unwrap()).unwrap();
+        let entry = restored.get("alpha-ref").unwrap();
+        assert_eq!(entry.native_source.as_ref().unwrap().generation, 2);
+        assert!(entry.ever_dangerous);
     }
 }

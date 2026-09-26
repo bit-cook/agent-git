@@ -51,6 +51,7 @@ fn prepared(scan: WatchScan, cwd: PathBuf) -> PreparedWatch {
         },
         cwd,
         protection_repo: None,
+        enrolled: None,
         from_line: 0,
         total_lines: 0,
         absolute_lines: true,
@@ -174,6 +175,34 @@ async fn unadopted_watch_preserves_message_text_without_exposing_secrets() {
             if frame.method() == "session.permissionMode" {
                 assert!(model_seen);
                 assert_eq!(frame.params.as_ref().unwrap()["mode"], "auto");
+                break;
+            }
+        }
+    })
+    .await;
+    {
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(cwd.join("history.jsonl"))
+            .unwrap();
+        writeln!(
+            file,
+            "{}",
+            serde_json::json!({"type":"turn_context","payload":{
+                "model":"external-model", "approval_policy":"on-request",
+                "sandbox_policy":{"type":"read-only"}
+            }})
+        )
+        .unwrap();
+    }
+    ready(async {
+        while let Some(frame) = received.recv().await {
+            if frame.method() == "session.permissionMode" {
+                assert_eq!(
+                    frame.params.as_ref().unwrap().get("mode"),
+                    Some(&serde_json::Value::Null)
+                );
                 break;
             }
         }

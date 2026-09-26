@@ -37,6 +37,7 @@ pub(super) struct Controller {
     scope: Scope,
     owner: Owner,
     slot: Slot,
+    pub(super) resource_pin: Option<Arc<()>>,
 }
 
 #[derive(Clone)]
@@ -57,14 +58,20 @@ impl Scope {
 
     fn canonical(&self, resources: &Resources) -> bool {
         match self {
-            Self::Session(scope) => resources.session(&scope.session_id).is_some_and(|session| {
-                session.runtime == scope.runtime
-                    && if session.native_id.is_empty() {
-                        session.id == scope.session_id
-                    } else {
-                        session.native_id == scope.session_id
-                    }
-            }),
+            Self::Session(scope) => {
+                resources
+                    .controller_session(&scope.session_id)
+                    .is_some_and(|session| {
+                        session.runtime == scope.runtime
+                            && if let Some(source) = &session.source {
+                                source.session_ref(&session.native_id) == scope.session_id
+                            } else if session.native_id.is_empty() {
+                                session.id == scope.session_id
+                            } else {
+                                session.native_id == scope.session_id
+                            }
+                    })
+            }
             Self::Project(scope) => {
                 Path::new(&scope.local_path).is_absolute()
                     && resources
@@ -132,7 +139,12 @@ impl Owners {
             pending.publish(&path, &file_owner)
         })
         .await??;
-        Ok(Some(Controller { scope, owner, slot }))
+        Ok(Some(Controller {
+            scope,
+            owner,
+            slot,
+            resource_pin: None,
+        }))
     }
 
     fn slot(&self, key: &str, owner: &Owner) -> Slot {
@@ -286,7 +298,7 @@ impl Controller {
             unreachable!()
         };
         let Some(session) = resources
-            .session(&scope.session_id)
+            .controller_session(&scope.session_id)
             .filter(|_| self.canonical(resources))
         else {
             return Policy::default();
@@ -315,6 +327,7 @@ impl Controller {
                     "machine.describe"
                         | "workspace.list"
                         | "session.list"
+                        | "session.catalog.list"
                         | "runtime.models"
                         | "session.start"
                 ),
@@ -333,6 +346,7 @@ impl Controller {
                         | "runtime.models"
                         | "workspace.list"
                         | "session.list"
+                        | "session.catalog.list"
                         | "session.history"
                         | "session.goal.read"
                         | "session.subscribe"
@@ -340,6 +354,7 @@ impl Controller {
                         | "session.unwatch"
                         | "session.commands"
                         | "session.model"
+                        | "session.catalog.settings"
                 ),
                 "controller mutations require an authenticated actor"
             );
@@ -448,6 +463,7 @@ mod tests {
                 access: Access::Control,
             }),
             owner: owner.clone(),
+            resource_pin: None,
             slot: Arc::new(Ownership {
                 current: RwLock::new(owner),
                 admission: Mutex::new(()),
@@ -571,6 +587,120 @@ mod tests {
     }
 
     #[test]
+    fn source_controller_keeps_its_resource_through_page_eviction_but_not_source_revocation() {
+        let root = tempfile::tempdir().unwrap();
+        crate::rc::with_agit_home(root.path(), || {
+            let project = root.path().join("project");
+            std::fs::create_dir(&project).unwrap();
+            let project = project.canonicalize().unwrap();
+            let mut mirror = crate::rc::mirror::Mirror::default();
+            mirror
+                .bind(crate::rc::endpoint::WORKSPACE, "project", &project)
+                .unwrap();
+            mirror.save().unwrap();
+            let registry = crate::rc::runtime_sources::Registry::open().unwrap();
+            let mut sources = Vec::new();
+            for name in ["alpha", "beta"] {
+                let home = root.path().join(name);
+                std::fs::create_dir(&home).unwrap();
+                let path = home.join("thread.jsonl");
+                std::fs::write(
+                    &path,
+                    format!(
+                        "{}\n",
+                        json!({"type":"session_meta","payload":{"id":"copied","cwd":project}})
+                    ),
+                )
+                .unwrap();
+                let db = rusqlite::Connection::open(home.join("state_1.sqlite")).unwrap();
+                db.execute_batch("CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT, cwd TEXT, first_user_message TEXT, thread_source TEXT, updated_at_ms INTEGER, archived INTEGER)").unwrap();
+                db.execute(
+                    "INSERT INTO threads VALUES ('copied',?1,?2,'Preview','cli',1,0)",
+                    rusqlite::params![path.to_str(), project.to_str()],
+                )
+                .unwrap();
+                sources.push(registry.register(&home, None, None, None).unwrap());
+            }
+            let catalog = crate::rc::runtime_catalog::Catalog::open().unwrap();
+            let roots = mirror.roots(crate::rc::endpoint::WORKSPACE);
+            for _ in &sources {
+                catalog.reconcile(&roots).unwrap();
+            }
+            let reference = sources[0].session_ref("copied");
+            let other = sources[1].session_ref("copied");
+            let mut resources = Resources::load().unwrap();
+            let session = resources.prepare_controller_source(&reference).unwrap();
+            let pin = resources.pin_controller_source(session).unwrap();
+            let owner = Owner {
+                generation: 1,
+                source: "controller".into(),
+            };
+            let controller = Controller {
+                scope: Scope::Session(SessionController {
+                    session_id: reference.clone(),
+                    runtime: "codex".into(),
+                    generation: 1,
+                    access: Access::Control,
+                }),
+                owner: owner.clone(),
+                resource_pin: Some(pin),
+                slot: Arc::new(Ownership {
+                    current: RwLock::new(owner),
+                    admission: Mutex::new(()),
+                }),
+            };
+            for page in 0..6 {
+                resources.observe("session.catalog.list", &json!({"rows":(0..500).map(|n| json!({
+                    "session_ref":format!("local-{:064x}",page*500+n),"source_id":"unrelated","source_generation":1,
+                    "native_session_id":format!("other-{n}"),"runtime":"codex","cwd":project
+                })).collect::<Vec<_>>()}));
+            }
+            assert!(controller.canonical(&resources));
+            assert!(resources.controller_session("copied").is_none());
+            let principal = Principal {
+                issuer: "https://cloud.example".into(),
+                account_id: "owner".into(),
+            };
+            let base = Policy::new(
+                1,
+                vec![Rule {
+                    principal: principal.clone(),
+                    resource: Resource::Machine,
+                    access: Access::Admin,
+                }],
+            )
+            .unwrap();
+            let policy = controller.policy(&base, &resources, &principal);
+            assert_eq!(
+                policy.access(&principal, Some(&reference), None),
+                Access::Control
+            );
+            assert_eq!(policy.access(&principal, Some(&other), None), Access::Deny);
+            assert_eq!(
+                policy.access(&principal, Some("copied"), None),
+                Access::Deny
+            );
+            let retained = controller.clone();
+            drop(controller);
+            resources.refresh(Resources::load().unwrap());
+            assert!(retained.canonical(&resources));
+            registry.remove(&sources[0].source_id).unwrap();
+            resources.refresh(Resources::load().unwrap());
+            assert!(!retained.canonical(&resources));
+            assert_eq!(
+                retained.policy(&base, &resources, &principal).access(
+                    &principal,
+                    Some(&reference),
+                    None
+                ),
+                Access::Deny
+            );
+            assert!(resources.prepare_controller_source(&reference).is_err());
+            assert!(resources.prepare_controller_source(&other).is_ok());
+        });
+    }
+
+    #[test]
     fn delegated_owner_is_session_scoped_and_replacement_fences_its_commands() {
         let principal = Principal {
             issuer: "https://cloud.example".into(),
@@ -605,6 +735,7 @@ mod tests {
                 access: Access::Control,
             }),
             owner: owner.clone(),
+            resource_pin: None,
             slot: Arc::new(Ownership {
                 current: RwLock::new(owner),
                 admission: Mutex::new(()),

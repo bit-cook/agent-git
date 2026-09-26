@@ -1,9 +1,16 @@
 //! Expand explicitly selected local prompts using the documented Codex placeholders.
 use anyhow::{Context, ensure};
 use serde_json::{Value, json};
-use std::{collections::HashMap, io::Read, path::PathBuf};
+use std::{
+    collections::HashMap,
+    io::Read,
+    path::{Path, PathBuf},
+};
 
-fn directory() -> crate::Result<PathBuf> {
+fn directory(home: Option<&Path>) -> crate::Result<PathBuf> {
+    if let Some(home) = home {
+        return Ok(home.join("prompts"));
+    }
     Ok(std::env::var_os("CODEX_HOME")
         .filter(|v| !v.is_empty())
         .map(PathBuf::from)
@@ -20,10 +27,10 @@ fn valid_name(name: &str) -> bool {
             .all(|c| c.is_alphanumeric() || "_-".contains(c))
 }
 
-fn read(name: &str) -> crate::Result<(String, String, String)> {
+fn read(home: Option<&Path>, name: &str) -> crate::Result<(String, String, String)> {
     ensure!(valid_name(name), "Invalid custom prompt name");
     let mut source = String::new();
-    let file = std::fs::File::open(directory()?.join(format!("{name}.md")))?;
+    let file = std::fs::File::open(directory(home)?.join(format!("{name}.md")))?;
     ensure!(
         file.metadata()?.is_file(),
         "Custom prompt must be a Markdown file"
@@ -62,8 +69,8 @@ fn parse(source: &str) -> (String, String, String) {
     )
 }
 
-pub(super) fn catalog() -> crate::Result<Vec<Value>> {
-    let root = directory()?;
+pub(super) fn catalog(home: Option<&Path>) -> crate::Result<Vec<Value>> {
+    let root = directory(home)?;
     if !root.exists() {
         return Ok(Vec::new());
     }
@@ -81,7 +88,7 @@ pub(super) fn catalog() -> crate::Result<Vec<Value>> {
         else {
             continue;
         };
-        if let Ok((_, description, hint)) = read(name) {
+        if let Ok((_, description, hint)) = read(home, name) {
             entries.push(json!({"name":format!("prompts:{name}"),"description":description,"argument_hint":hint,"kind":"prompt"}));
         }
     }
@@ -89,8 +96,8 @@ pub(super) fn catalog() -> crate::Result<Vec<Value>> {
     Ok(entries)
 }
 
-pub(super) fn expand(name: &str, arguments: &str) -> crate::Result<String> {
-    let (body, _, _) = read(name)?;
+pub(super) fn expand(home: Option<&Path>, name: &str, arguments: &str) -> crate::Result<String> {
+    let (body, _, _) = read(home, name)?;
     substitute(&body, arguments)
 }
 

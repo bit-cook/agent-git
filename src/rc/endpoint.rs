@@ -2,6 +2,7 @@
 
 mod cloud;
 mod output;
+mod receipts;
 
 use output::ClientOutput;
 
@@ -97,6 +98,88 @@ struct MessageReceipt {
     digest: Vec<u8>,
     response: Option<Frame>,
     created: std::time::Instant,
+}
+
+type PendingRequests = HashMap<RequestId, (u64, RequestId, Option<String>, Work)>;
+
+enum ReceiptEvent {
+    Claimed {
+        frame: Frame,
+        key: String,
+        result: Box<crate::Result<(receipts::Receipt, bool)>>,
+    },
+    Finished {
+        frame: Frame,
+        key: String,
+        not_sent: bool,
+        replay: Option<super::outbound::ReplayBatch>,
+    },
+}
+
+fn receipt_response(entry: &MessageReceipt, digest: &[u8], id: RequestId) -> Frame {
+    let mut response = if entry.digest != digest {
+        Frame::error_response(
+            id.clone(),
+            RpcError::new(
+                ErrorCode::SessionBusy,
+                "message ID was already used with different content",
+            ),
+        )
+    } else if let Some(response) = &entry.response {
+        response.clone()
+    } else {
+        let mut error = RpcError::new(
+            ErrorCode::SessionBusy,
+            "message acceptance is unconfirmed; check the conversation before sending more input",
+        );
+        error.data = Some(serde_json::json!({"outcome":"unknown","retryable":false}));
+        Frame::error_response(id.clone(), error)
+    };
+    response.id = Some(id);
+    response
+}
+
+async fn deliver_response(
+    mut frame: Frame,
+    replay: Option<super::outbound::ReplayBatch>,
+    pending: &mut PendingRequests,
+    clients: &mut HashMap<u64, Client>,
+    diagnostics: &Option<super::diagnostics::Log>,
+) {
+    let Some((client, original, _, work)) = frame.id.as_ref().and_then(|id| pending.remove(id))
+    else {
+        return;
+    };
+    frame.id = Some(original);
+    if let Some(log) = diagnostics {
+        log.response(client, &frame);
+    }
+    if let Some(peer) = clients.get(&client) {
+        if let Some(cloud) = &peer.cloud {
+            cloud.observe_response(&frame);
+        }
+        let result = if let Some(replay) = replay {
+            let frames = replay.frames.len();
+            let result = peer.output.send_replay(frame.to_json(), replay, work);
+            if let Some(log) = diagnostics {
+                log.record("executor.replay_queued", serde_json::json!({"client_id":client,"request_id":frame.id,"frames":frames,"succeeded":result.is_ok()}));
+            }
+            result
+        } else {
+            peer.output
+                .send_work(frame.to_json(), std::time::Duration::from_secs(2), work)
+                .await
+        };
+        if result.is_err() {
+            if let Some(log) = diagnostics {
+                log.record(
+                    "executor.client_closed",
+                    serde_json::json!({"client_id":client,"reason":"response_output_capacity"}),
+                );
+            }
+            clients.remove(&client);
+        }
+    }
 }
 
 fn message_key(frame: &Frame) -> Option<String> {
@@ -229,6 +312,9 @@ pub async fn serve(
         diagnostics,
         Some(cloud),
         admission,
+        Some(receipts::Store::at(
+            crate::infra::config::agit_home()?.join("desktop-rc/message-receipts"),
+        )),
     )
     .await
 }
@@ -243,11 +329,13 @@ async fn serve_described(
     diagnostics: Option<super::diagnostics::Log>,
     mut cloud: Option<cloud::Ingress>,
     admission: Admission,
+    receipt_store: Option<receipts::Store>,
 ) -> crate::Result<()> {
     let (input, mut incoming) = mpsc::channel::<Incoming>(256);
     let mut clients = HashMap::<u64, Client>::new();
     let history_slots = std::sync::Arc::new(tokio::sync::Semaphore::new(4));
-    let mut pending = HashMap::<RequestId, (u64, RequestId, Option<String>, Work)>::new();
+    let mut pending = PendingRequests::new();
+    let mut receipt_tasks = tokio::task::JoinSet::new();
     let mut receipts = HashMap::<String, MessageReceipt>::new();
     let mut serial = 0_u64;
     let discovery_slots = std::sync::Arc::new(tokio::sync::Semaphore::new(2));
@@ -257,6 +345,42 @@ async fn serve_described(
     let mut cloud_admissions = tokio::task::JoinSet::new();
     loop {
         tokio::select! {
+            Some(completed) = receipt_tasks.join_next(), if !receipt_tasks.is_empty() => {
+                match completed.context("message receipt task stopped")? {
+                    ReceiptEvent::Claimed { frame, key, result } => {
+                        let id = frame.id.clone().context("message claim has no request ID")?;
+                        match *result {
+                            Ok((_, true)) => {
+                                events.send(super::link::LinkEvent::Frame { epoch:1, frame:Box::new(frame) }).await?;
+                            }
+                            result => {
+                                let response = match result {
+                                    Ok((saved, false)) => {
+                                        let entry = MessageReceipt { digest:saved.digest, response:saved.response, created:std::time::Instant::now() };
+                                        let response = receipt_response(&entry, &message_digest(&frame), id);
+                                        receipts.insert(key, entry);
+                                        response
+                                    }
+                                    Err(error) => {
+                                        eprintln!("agitd: message claim is unavailable: {error}");
+                                        let mut error = RpcError::new(ErrorCode::RuntimeUnavailable,
+                                            "Message acceptance could not be verified. Check the conversation before sending more input.");
+                                        error.data = Some(serde_json::json!({"outcome":"unknown","retryable":false}));
+                                        Frame::error_response(id, error)
+                                    }
+                                    Ok((_, true)) => unreachable!(),
+                                };
+                                deliver_response(response, None, &mut pending, &mut clients, &diagnostics).await;
+                            }
+                        }
+                    }
+                    ReceiptEvent::Finished { frame, key, not_sent, replay } => {
+                        if not_sent { receipts.remove(&key); }
+                        else if let Some(entry) = receipts.get_mut(&key) { entry.response = Some(frame.clone()); }
+                        deliver_response(frame, replay, &mut pending, &mut clients, &diagnostics).await;
+                    }
+                }
+            }
             Some(accepted) = async { cloud.as_mut().unwrap().incoming.recv().await }, if cloud.is_some() => {
                 if clients.values().filter(|client| client.cloud.is_some()).count() + cloud_admissions.len() >= MAX_CLIENTS {
                     continue;
@@ -374,9 +498,12 @@ async fn serve_described(
                                     let cwd = params.get("cwd").and_then(serde_json::Value::as_str).filter(|s| !s.is_empty()).map(PathBuf::from)
                                         .unwrap_or_else(|| crate::infra::config::user_home().unwrap_or_default());
                                     let result = if is_goal { super::local_goal::read(params).await } else { super::harness::models::discover(runtime, cwd).await };
-                                    match result {
-                                        Ok(models) => Frame::response(original_id, models),
-                                        Err(error) => Frame::error_response(original_id, RpcError::new(ErrorCode::RuntimeUnavailable, error.to_string())),
+                                    match frame.authority.check() {
+                                        Err(error) => Frame::error_response(original_id, error),
+                                        Ok(()) => match result {
+                                            Ok(models) => Frame::response(original_id, models),
+                                            Err(error) => Frame::error_response(original_id, RpcError::new(ErrorCode::RuntimeUnavailable, error.to_string())),
+                                        },
                                     }
                                 } else { Frame::error_response(original_id, RpcError::new(ErrorCode::SessionBusy, "Runtime inspection is busy; try again shortly")) };
                                 let _ = output.send_work(response.to_json(), std::time::Duration::from_secs(2), work).await;
@@ -422,20 +549,18 @@ async fn serve_described(
                             }
                             let key = message_key(&frame).map(|key| peer.cloud.as_ref().map_or_else(|| key.clone(), |guard| guard.receipt_key(key.clone(), &frame)));
                             if let Some(key) = &key {
-                                receipts.retain(|_, entry| entry.response.is_none() || entry.created.elapsed().as_secs() < 600);
+                                receipts.retain(|key, entry| entry.created.elapsed().as_secs() < 600
+                                    || pending.values().any(|(_, _, active, _)| active.as_ref() == Some(key))
+                                    || (receipt_store.is_none() && entry.response.is_none()));
                                 if let Some(entry) = receipts.get(key) {
-                                    let mut response = if entry.digest != message_digest(&frame) {
-                                        Frame::error_response(original_id.clone(), RpcError::new(ErrorCode::SessionBusy, "message ID was already used with different content"))
-                                    } else if let Some(response) = &entry.response {
-                                        response.clone()
-                                    } else {
-                                        let mut error = RpcError::new(ErrorCode::SessionBusy, "message acceptance is pending; retry with the same message ID");
-                                        error.data = Some(serde_json::json!({"outcome":"unknown"}));
-                                        Frame::error_response(original_id.clone(), error)
-                                    };
-                                    response.id = Some(original_id);
+                                    let response = receipt_response(entry, &message_digest(&frame), original_id);
+                                    if let Some(cloud) = &peer.cloud { cloud.observe_response(&response); }
                                     if peer.output.send_work(response.to_json(), std::time::Duration::from_secs(2), work).await.is_err() { clients.remove(&client); }
                                     continue;
+                                }
+                                if receipt_store.is_some() && receipts.len() >= 4096
+                                    && let Some(oldest) = receipts.iter().filter(|(key, _)| !pending.values().any(|(_, _, active, _)| active.as_ref() == Some(*key))).min_by_key(|(_, entry)| entry.created).map(|(key, _)| key.clone()) {
+                                    receipts.remove(&oldest);
                                 }
                                 if receipts.len() >= 4096 || key.len() > 1024 {
                                     let response = Frame::error_response(original_id, RpcError::new(ErrorCode::SessionBusy, "message retry capacity exceeded; nothing was sent"));
@@ -449,7 +574,14 @@ async fn serve_described(
                                 log.dispatch(client, &original_id, &id, frame.method());
                             }
                             frame.id = Some(id.clone());
-                            pending.insert(id, (client, original_id, key, work));
+                            pending.insert(id, (client, original_id, key.clone(), work));
+                            if let (Some(key), Some(store)) = (key, receipt_store.clone()) {
+                                receipt_tasks.spawn(async move {
+                                    let result = store.claim(key.clone(), message_digest(&frame)).await;
+                                    ReceiptEvent::Claimed { frame, key, result: Box::new(result) }
+                                });
+                                continue;
+                            }
                             events.send(super::link::LinkEvent::Frame { epoch: 1, frame: Box::new(frame) }).await?;
                         }
                         Err(error) => {
@@ -464,13 +596,7 @@ async fn serve_described(
                 let replay = write.take_replay();
                 write.commit();
                 if let Some(id) = &frame.id {
-                    if let Some((client, original, key, work)) = pending.remove(id) {
-                        if let Some(log) = &diagnostics {
-                            let mut response = frame.clone();
-                            response.id = Some(original.clone());
-                            log.response(client, &response);
-                        }
-                        if let Some(key) = key {
+                    if let Some(key) = pending.get(id).and_then(|(_, _, key, _)| key.clone()) {
                             // Daemon busy replies certify no native write unless they explicitly
                             // retain uncertainty. An uncertain receipt keeps its operation identity.
                             let not_sent = if let Some(error) = frame.error.as_mut().filter(|error| error.is(ErrorCode::SessionBusy)) {
@@ -482,35 +608,22 @@ async fn serve_described(
                             } else {
                                 false
                             };
-                            if not_sent {
-                                receipts.remove(&key);
-                            } else if let Some(entry) = receipts.get_mut(&key) {
-                                entry.response = Some(frame.clone());
-                            }
+                        if !not_sent && let Some(entry) = receipts.get_mut(&key) {
+                            entry.response = Some(frame.clone());
                         }
-                        frame.id = Some(original);
-                        if let Some(peer) = clients.get(&client) {
-                            if let Some(cloud) = &peer.cloud {
-                                cloud.observe_response(&frame);
-                            }
-                            let result = if let Some(replay) = replay {
-                                let frames = replay.frames.len();
-                                let result = peer.output.send_replay(frame.to_json(), replay, work);
-                                if let Some(log) = &diagnostics {
-                                    log.record("executor.replay_queued", serde_json::json!({"client_id":client,"request_id":frame.id,"frames":frames,"succeeded":result.is_ok()}));
+                        if let Some(store) = receipt_store.clone() {
+                            receipt_tasks.spawn(async move {
+                                if let Err(error) = store.finish(key.clone(), (!not_sent).then(|| frame.clone())).await {
+                                    eprintln!("agitd: message result could not be persisted; its durable claim remains uncertain: {error}");
                                 }
-                                result
-                            } else {
-                                peer.output.send_work(frame.to_json(), std::time::Duration::from_secs(2), work).await
-                            };
-                            if result.is_err() {
-                                if let Some(log) = &diagnostics {
-                                    log.record("executor.client_closed", serde_json::json!({"client_id":client,"reason":"response_output_capacity"}));
-                                }
-                                clients.remove(&client);
-                            }
+                                ReceiptEvent::Finished { frame, key, not_sent, replay }
+                            });
+                            continue;
                         }
+                        if not_sent { receipts.remove(&key); }
+                        else if let Some(entry) = receipts.get_mut(&key) { entry.response = Some(frame.clone()); }
                     }
+                    deliver_response(frame, replay, &mut pending, &mut clients, &diagnostics).await;
                 } else {
                     if frame.method() == crate::protocol::method::SESSION_STATUS
                         && let Some(log) = &diagnostics {
@@ -561,6 +674,7 @@ mod tests {
             None,
             None,
             admission.clone(),
+            None,
         ));
         let mut client = UnixStream::connect(&path).await.unwrap();
         let request = Frame::request("project.bind", serde_json::json!({}));
@@ -606,6 +720,7 @@ mod tests {
             None,
             None,
             Admission::default(),
+            Some(receipts::Store::at(root.path().join("receipts"))),
         ));
         let mut client = BufReader::new(UnixStream::connect(&path).await.unwrap());
         let request = Frame::request("machine.describe", serde_json::json!({}));
@@ -655,6 +770,95 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pending_receipt_storage_does_not_block_reads_or_live_output() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("rpc");
+        let (out, outbound) = super::super::outbound::channel();
+        let (events, mut requests) = mpsc::channel(16);
+        let gate = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
+        let admission = Admission::default();
+        let server = tokio::spawn(serve_described(
+            UnixListener::bind(&path).unwrap(),
+            outbound,
+            events,
+            serde_json::json!({"instance_id":"responsive"}),
+            super::super::peers::controller().unwrap(),
+            None,
+            None,
+            admission.clone(),
+            Some(receipts::Store::gated(
+                root.path().join("receipts"),
+                gate.clone(),
+            )),
+        ));
+        let mut writer = BufReader::new(UnixStream::connect(&path).await.unwrap());
+        let request = Frame::request(
+            "turn.start",
+            serde_json::json!({
+                "session_id":"conversation", "client_msg_id":"message", "message":"hello"
+            }),
+        );
+        writer
+            .get_mut()
+            .write_all(format!("{}\n", request.to_json()).as_bytes())
+            .await
+            .unwrap();
+        let mut reader = BufReader::new(UnixStream::connect(&path).await.unwrap());
+        // A queued inspection proves the routing loop can advance past the claim.
+        let inspection = Frame::request("machine.describe", serde_json::json!({}));
+        writer
+            .get_mut()
+            .write_all(format!("{}\n", inspection.to_json()).as_bytes())
+            .await
+            .unwrap();
+        async fn receive(client: &mut BufReader<UnixStream>) -> Frame {
+            let mut line = String::new();
+            tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                client.read_line(&mut line),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            serde_json::from_str(&line).unwrap()
+        }
+        assert_eq!(receive(&mut writer).await.id, inspection.id);
+        assert!(requests.try_recv().is_err());
+        assert!(admission.freeze().is_err());
+        gate.add_permits(1);
+        let super::super::link::LinkEvent::Frame { frame, .. } =
+            tokio::time::timeout(std::time::Duration::from_secs(5), requests.recv())
+                .await
+                .unwrap()
+                .unwrap();
+        out.send(Frame::response(
+            frame.id.unwrap(),
+            serde_json::json!({"turn_id":"turn"}),
+        ));
+        out.send(Frame::notification(
+            "fixture.output",
+            serde_json::json!({"text":"still streaming"}),
+        ));
+        assert_eq!(receive(&mut reader).await.method(), "fixture.output");
+        reader
+            .get_mut()
+            .write_all(format!("{}\n", inspection.to_json()).as_bytes())
+            .await
+            .unwrap();
+        assert_eq!(receive(&mut reader).await.id, inspection.id);
+        assert!(admission.freeze().is_err());
+        gate.add_permits(1);
+        loop {
+            let response = receive(&mut writer).await;
+            if response.id == request.id {
+                assert_eq!(response.result.unwrap()["turn_id"], "turn");
+                break;
+            }
+        }
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn accepted_messages_replay_across_clients_without_a_second_native_dispatch() {
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
         let root = tempfile::tempdir().unwrap();
@@ -671,6 +875,7 @@ mod tests {
             None,
             None,
             Admission::default(),
+            Some(receipts::Store::at(root.path().join("receipts"))),
         ));
         let mut first = BufReader::new(UnixStream::connect(&path).await.unwrap());
         let request = Frame::request(

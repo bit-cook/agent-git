@@ -14,6 +14,7 @@ pub(super) fn rpc_test_live(
         generation,
         info: SessionInfo {
             session_id: session_id.into(),
+            native_source: None,
             runtime_session_id: None,
             workspace_id: "ws-a".into(),
             project_id: None,
@@ -88,6 +89,7 @@ fn rpc_test_roster_entry(
     mode: crate::protocol::PermissionMode,
 ) -> crate::rc::roster::Entry {
     crate::rc::roster::Entry {
+        native_source: None,
         runtime: "codex".into(),
         thread_id: format!("thread-{session_id}"),
         cwd: "/tmp/project".into(),
@@ -192,7 +194,7 @@ impl Daemon {
         caller: &crate::protocol::CallerClaim,
         frames: &mpsc::Sender<Frame>,
     ) -> Result<serde_json::Value, RpcError> {
-        let prepared = self.prepare_resume_session(p, caller, frames)?;
+        let prepared = self.prepare_resume_session(p, caller, frames, &Default::default())?;
         prepared.run_inline(self).await
     }
 

@@ -1,24 +1,58 @@
 use super::*;
 
+#[tokio::test]
+async fn source_sessions_remain_addressable_only_by_logical_identity() {
+    let (tx, _) = mpsc::channel(1);
+    let mut live = rpc_test_live("logical", 1, tx, crate::protocol::PermissionMode::Plan);
+    live.runtime_thread_id = Some("copied-native".into());
+    live.info.native_source = Some(crate::protocol::NativeSourceRef {
+        source_id: "alpha".into(),
+        generation: 1,
+    });
+    let daemon = rpc_test_daemon(HashMap::from([("logical".into(), live)]), Roster::default());
+    let mut state = daemon.lock().await;
+    let caller = claim("owner", "ws-a");
+    assert!(state.supervised_in("copied-native", &caller).is_none());
+    assert!(state.supervised_in("logical", &caller).is_some());
+    assert!(
+        state
+            .supervised_in("logical", &claim("owner", "ws-b"))
+            .is_none()
+    );
+    state.sessions.get_mut("logical").unwrap().ended = true;
+    assert!(!state.ending_in("copied-native", &caller));
+    assert!(state.ending_in("logical", &caller));
+    state
+        .sessions
+        .get_mut("logical")
+        .unwrap()
+        .info
+        .native_source = None;
+    assert!(state.ending_in("copied-native", &caller));
+}
+
 #[test]
 fn watch_danger_uses_the_logical_roster_identity_and_workspace() {
     let mut roster = crate::rc::roster::Roster::default();
-    roster.record(
-        "agit-logical",
-        crate::rc::roster::Entry {
-            runtime: "claude-code".into(),
-            thread_id: "native-1".into(),
-            cwd: "/tmp/project".into(),
-            workspace_id: "ws-a".into(),
-            project_id: None,
-            agit_session: None,
-            expected_agent_id: None,
-            permission_mode: None,
-            guard_attempts: Default::default(),
-            prior_threads: vec![],
-            ever_dangerous: true,
-        },
-    );
+    roster
+        .record(
+            "agit-logical",
+            crate::rc::roster::Entry {
+                native_source: None,
+                runtime: "claude-code".into(),
+                thread_id: "native-1".into(),
+                cwd: "/tmp/project".into(),
+                workspace_id: "ws-a".into(),
+                project_id: None,
+                agit_session: None,
+                expected_agent_id: None,
+                permission_mode: None,
+                guard_attempts: Default::default(),
+                prior_threads: vec![],
+                ever_dangerous: true,
+            },
+        )
+        .unwrap();
 
     assert!(roster.transcript_ever_dangerous("claude-code", "native-1", "ws-a", "/tmp/project"));
     // When a second workspace binds the same directory, that side sees the same transcript, so
@@ -56,6 +90,7 @@ fn watch_danger_uses_the_logical_roster_identity_and_workspace() {
 fn an_unaccounted_dangerous_start_locks_unknown_threads_to_the_owner() {
     fn unbound() -> crate::rc::roster::Entry {
         crate::rc::roster::Entry {
+            native_source: None,
             runtime: "codex".into(),
             thread_id: String::new(),
             cwd: "/tmp/project".into(),
@@ -70,7 +105,7 @@ fn an_unaccounted_dangerous_start_locks_unknown_threads_to_the_owner() {
         }
     }
     let mut roster = crate::rc::roster::Roster::default();
-    roster.record("agit-crashed", unbound());
+    roster.record("agit-crashed", unbound()).unwrap();
 
     assert!(
         roster.transcript_ever_dangerous("codex", "unknown-native", "ws-a", "/elsewhere"),
@@ -92,13 +127,15 @@ fn an_unaccounted_dangerous_start_locks_unknown_threads_to_the_owner() {
     // Once `Bound` fills in the real id the poisoning lifts: an unknown thread is judged
     // normally again, while that session itself is accounted for by thread id and stays
     // dangerous.
-    roster.record(
-        "agit-crashed",
-        crate::rc::roster::Entry {
-            thread_id: "native-9".into(),
-            ..unbound()
-        },
-    );
+    roster
+        .record(
+            "agit-crashed",
+            crate::rc::roster::Entry {
+                thread_id: "native-9".into(),
+                ..unbound()
+            },
+        )
+        .unwrap();
     assert!(!roster.transcript_ever_dangerous("codex", "unknown-native", "ws-a", "/tmp/project"));
     assert!(roster.transcript_ever_dangerous("codex", "native-9", "ws-a", "/tmp/project"));
 }
@@ -450,6 +487,7 @@ fn a_dangerous_start_is_durable_before_the_harness_launches() {
                 let now = chrono::Utc::now().to_rfc3339();
                 let info = SessionInfo {
                     session_id: "agit-danger-start".into(),
+                    native_source: None,
                     runtime_session_id: None,
                     workspace_id: "ws-a".into(),
                     project_id: Some("project-a".into()),
@@ -532,6 +570,7 @@ fn a_launch_that_resumes_a_transcript_it_never_cleared_is_refused() {
                 let now = chrono::Utc::now().to_rfc3339();
                 let info = SessionInfo {
                     session_id: "agit-unjudged".into(),
+                    native_source: None,
                     runtime_session_id: None,
                     workspace_id: "ws-a".into(),
                     project_id: Some("project-a".into()),
@@ -596,6 +635,7 @@ fn a_launch_that_resumes_a_transcript_it_never_cleared_is_refused() {
                 // owner-only gate.
                 let info = SessionInfo {
                     session_id: "agit-unauthorized".into(),
+                    native_source: None,
                     runtime_session_id: None,
                     workspace_id: "ws-a".into(),
                     project_id: Some("project-a".into()),
@@ -722,6 +762,7 @@ async fn start_session_replays_a_completed_start_after_a_display_name_change() {
     let start_id = "018f47cb-60ff-7e31-aec9-02d2e39d3114";
     let session = SessionInfo {
         session_id: "agit-existing".into(),
+        native_source: None,
         runtime_session_id: None,
         workspace_id: "ws-a".into(),
         project_id: Some("project-a".into()),
@@ -1714,6 +1755,7 @@ async fn next_turn_mode_stays_pending_until_the_immediate_fact_arrives() {
         generation: 1,
         info: SessionInfo {
             session_id: "s-1".into(),
+            native_source: None,
             runtime_session_id: None,
             workspace_id: "ws-1".into(),
             project_id: None,
@@ -1747,8 +1789,9 @@ async fn next_turn_mode_stays_pending_until_the_immediate_fact_arrives() {
         Frame::notification(
             method::SESSION_PERMISSION_MODE,
             crate::protocol::SessionPermissionMode {
+                native_default: false,
                 session_id: "s-1".into(),
-                mode: crate::protocol::PermissionMode::Plan,
+                mode: Some(crate::protocol::PermissionMode::Plan),
                 applied,
                 by: Some("owner".into()),
             },
@@ -1820,8 +1863,9 @@ fn shutdown_guard_suppresses_mode_frames_and_clamps_every_save_path() {
                         generation,
                         method::SESSION_PERMISSION_MODE,
                         serde_json::to_value(crate::protocol::SessionPermissionMode {
+                            native_default: false,
                             session_id: "session-a".into(),
-                            mode,
+                            mode: Some(mode),
                             applied,
                             by: Some("owner".into()),
                         })
@@ -1932,6 +1976,7 @@ fn a_viewer_joining_at_the_last_moment_keeps_the_tail_alive() {
     let mk = |last_active: u64| WatchLive {
         info: SessionInfo {
             session_id: "s".into(),
+            native_source: None,
             runtime_session_id: None,
             workspace_id: "ws".into(),
             project_id: None,
@@ -2093,8 +2138,9 @@ async fn stale_generation_is_dropped_before_every_session_projection_side_effect
             1,
             method::SESSION_PERMISSION_MODE,
             serde_json::to_value(crate::protocol::SessionPermissionMode {
+                native_default: false,
                 session_id: "session-a".into(),
-                mode: PermissionMode::Bypass,
+                mode: Some(PermissionMode::Bypass),
                 applied: PermissionApply::Immediate,
                 by: Some("owner".into()),
             })
@@ -2200,8 +2246,9 @@ async fn current_generation_projects_every_session_fact_and_scrubs_its_tag() {
         2,
         method::SESSION_PERMISSION_MODE,
         serde_json::to_value(crate::protocol::SessionPermissionMode {
+            native_default: false,
             session_id: "session-a".into(),
-            mode: PermissionMode::Plan,
+            mode: Some(PermissionMode::Plan),
             applied: PermissionApply::Immediate,
             by: Some("owner".into()),
         })
@@ -2225,6 +2272,27 @@ async fn current_generation_projects_every_session_fact_and_scrubs_its_tag() {
             .approval_session_modes
             .get("fresh"),
         Some(&PermissionMode::Bypass)
+    );
+
+    let resolved = tagged_test_notification(
+        "session-a",
+        2,
+        method::APPROVAL_RESOLVED,
+        serde_json::json!({"session_id":"session-a","approval_id":"fresh"}),
+    );
+    let mut stale = resolved.clone();
+    stale.source_generation = Some(1);
+    assert!(state.project_session_frame(stale).is_none());
+    assert!(
+        state.sessions["session-a"]
+            .approval_session_modes
+            .contains_key("fresh")
+    );
+    assert!(state.project_session_frame(resolved).is_some());
+    assert!(
+        state.sessions["session-a"]
+            .approval_session_modes
+            .is_empty()
     );
 
     let completion = tagged_test_notification(
@@ -2271,8 +2339,8 @@ async fn current_generation_projects_every_session_fact_and_scrubs_its_tag() {
     let commit = state
         .project_session_frame(commit)
         .expect("a current connection-bound commit survives both fences");
-    assert_eq!(commit.params.unwrap()["through_seq"], 5);
-    assert_eq!(commit.seq, Some(6));
+    assert_eq!(commit.params.unwrap()["through_seq"], 6);
+    assert_eq!(commit.seq, Some(7));
     assert_eq!(delivery.status(), crate::protocol::DeliveryStatus::Pending);
 }
 
@@ -2455,6 +2523,7 @@ async fn failed_launch_does_not_advance_the_materialized_generation_tombstone() 
         .insert("session-a".into(), 1);
     let info = SessionInfo {
         session_id: "session-a".into(),
+        native_source: None,
         runtime_session_id: None,
         workspace_id: "ws-a".into(),
         project_id: None,
@@ -2826,7 +2895,7 @@ fn resumed_launch_does_not_replay_the_initial_model() {
             let opening = state.prepare_resume_session(SessionResume {
                 workspace_id:"ws".into(), session_id:"logical".into(), prompt:None,
                 by:None, agent:None, expected_agent_id:None, branch:None,
-            }, &claim("owner", "ws"), &frames).unwrap();
+            }, &claim("owner", "ws"), &frames, &Default::default()).unwrap();
             let SessionOpening::Launch(spawn, _) = opening else { panic!("expected a native resume"); };
             assert_eq!(spawn.spec.resume_from.as_deref(), Some("native-model-changed"));
             assert_eq!(spawn.spec.model, None);

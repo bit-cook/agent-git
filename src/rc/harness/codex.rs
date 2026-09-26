@@ -1,4 +1,4 @@
-//! codex driver — app-server JSON-RPC over stdio.
+//! Codex driver over a private stdio executor or a shared native socket.
 //!
 //! # Why this one is the easier of the two
 //!
@@ -22,9 +22,14 @@
 //! Method names below were read out of `codex app-server generate-ts` on the
 //! installed binary (codex-cli 0.147.0), not from documentation.
 
+mod background;
 mod commands;
 mod guardian;
 mod prompts;
+mod queue;
+mod transport;
+
+use transport::Transport;
 
 use super::proc::{LaunchError, Line, Proc, Pushback};
 
@@ -82,9 +87,8 @@ pub fn capability() -> RuntimeCapability {
             PermissionMode::Plan,
             PermissionMode::Bypass,
         ],
-        // codex has no live equivalent of `set_permission_mode`: the policy
-        // rides along with `turn/start` as a sticky override ("this turn and
-        // subsequent turns"), so a switch cannot land until the next turn.
+        // Private stdio sessions queue policy overrides at turn/start. Shared
+        // sessions update native defaults and report their execution boundary.
         permission_switch: Some(PermissionApply::NextTurn),
     }
 }
@@ -121,6 +125,7 @@ fn turn_sandbox_policy(mode: PermissionMode) -> Value {
 
 /// One approval awaiting an answer.
 struct PendingApproval {
+    response_sent: bool,
     /// Which server request the answer goes back to.
     req_id: Value,
     /// Which method asked — it decides the **shape** of the response, not just the decision
@@ -302,7 +307,10 @@ fn turn_start_response(
 }
 
 pub struct CodexDriver {
-    proc: Proc,
+    proc: Transport,
+    control: background::Control,
+    control_events: std::collections::VecDeque<HarnessEvent>,
+    source: Option<crate::rc::native_codex::Source>,
     thread_id: Option<String>,
     current_turn: Option<String>,
     /// Our own JSON-RPC id counter for client→server requests.
@@ -344,6 +352,8 @@ pub struct CodexDriver {
     /// a guard was lifted while the running turn is still asking for approvals.
     mode: PermissionMode,
     pending_mode: Option<PermissionMode>,
+    native_mode_unknown: bool,
+    native_model_unknown: bool,
     /// Exact request currently awaiting native acceptance. Its response is
     /// consumed by `next_event`, beside all intervening notifications, rather
     /// than by a blocking command handler.
@@ -373,6 +383,13 @@ impl CodexDriver {
     /// happen" unchanged: a `Proc::spawn` error is **provably never started**, while a
     /// handshake write that fails means the process is already running.
     pub async fn launch(spec: LaunchSpec) -> Result<CodexDriver, LaunchError> {
+        Self::launch_private(spec, None).await
+    }
+
+    async fn launch_private(
+        spec: LaunchSpec,
+        source: Option<&crate::rc::native_codex::Source>,
+    ) -> Result<CodexDriver, LaunchError> {
         let mut env: Vec<(String, String)> = vec![("AGIT_RC".into(), "1".into())];
         // codex tags every upstream request with an `originator` header, and it
         // uses a *different* value for `app-server` (`codex_app_server`) than for
@@ -387,9 +404,61 @@ impl CodexDriver {
             ));
         }
         env.extend(super::lineage_env(spec.agit_session.as_ref()));
-        let proc = Proc::spawn("codex", &["app-server".to_string()], &spec.cwd, &env)?;
+        if let Some(source) = source {
+            env.push((
+                "CODEX_HOME".into(),
+                source.home().to_string_lossy().into_owned(),
+            ));
+        }
+        let executable = source
+            .map(|source| source.executable().to_string_lossy().into_owned())
+            .unwrap_or_else(|| "codex".into());
+        let proc = Proc::spawn(
+            &executable,
+            &[
+                "-c".to_string(),
+                format!(
+                    "thread_unload_delay_secs={}",
+                    background::UNLOAD_DELAY_SECONDS
+                ),
+                "app-server".to_string(),
+            ],
+            &spec.cwd,
+            &env,
+        )?;
+        Self::with_transport(spec, proc.into(), source.cloned()).await
+    }
+
+    /// Attach one conversation without taking ownership of the native server process.
+    pub async fn launch_shared(
+        spec: LaunchSpec,
+        source: &crate::rc::native_codex::Source,
+    ) -> Result<CodexDriver, LaunchError> {
+        let client = match source.connect_or_start().await {
+            Ok(client) => client,
+            Err(error) if error.is::<crate::rc::native_codex::SharedServiceUnsupported>() => {
+                return Self::launch_private(spec, Some(source)).await;
+            }
+            Err(error) => return Err(LaunchError::spawned(error)),
+        };
+        Self::with_transport(
+            spec,
+            Transport::Shared(Box::new(client)),
+            Some(source.clone()),
+        )
+        .await
+    }
+
+    async fn with_transport(
+        spec: LaunchSpec,
+        proc: Transport,
+        source: Option<crate::rc::native_codex::Source>,
+    ) -> Result<Self, LaunchError> {
         let mut d = CodexDriver {
             proc,
+            control: Default::default(),
+            control_events: Default::default(),
+            source,
             thread_id: None,
             current_turn: None,
             next_id: Some(1),
@@ -411,6 +480,8 @@ impl CodexDriver {
             guardian_denials: Default::default(),
             mode: spec.effective_mode(),
             pending_mode: None,
+            native_mode_unknown: false,
+            native_model_unknown: false,
             pending_turn_start: None,
             retired_turn_starts: Default::default(),
             completed_turn_ids: Default::default(),
@@ -453,11 +524,8 @@ impl CodexDriver {
         }
         let id = self.alloc_id()?;
         let (policy, sandbox) = native_policy(self.mode);
-        // Both branches carry the policy. `thread/resume` used to omit it, which
-        // meant a resumed session silently fell back to whatever the user's
-        // `config.toml` says — so "take this conversation over from the web"
-        // could come back with a different guard than it had, in either
-        // direction, and nothing on screen would say so.
+        // Attaching to a shared thread preserves its native configuration. Settings
+        // changes require an explicit command after the current state is observed.
         // Native transcript projection consumes JSONL rollouts rather than paginated storage.
         let (method, mut params) = match &self.resume_from {
             Some(tid) => (
@@ -480,7 +548,13 @@ impl CodexDriver {
                 }),
             ),
         };
-        if let Some(model) = &self.model {
+        if self.proc.shared() && self.resume_from.is_some() {
+            params = json!({
+                "threadId": self.resume_from,
+                "excludeTurns": true,
+                "initialTurnsPage": {"limit": 1, "itemsView": "notLoaded", "sortDirection": "desc"}
+            });
+        } else if let Some(model) = &self.model {
             params["model"] = json!(model);
         }
         self.send(&json!({"id": id, "method": method, "params": params}))
@@ -488,6 +562,10 @@ impl CodexDriver {
         self.started = true;
         self.handshake_request = Some((id, method));
         Ok(())
+    }
+
+    pub(super) fn has_active_turn(&self) -> bool {
+        self.current_turn.is_some()
     }
 
     pub fn runtime_thread_id(&self) -> Option<&str> {
@@ -499,6 +577,12 @@ impl CodexDriver {
     /// sqlite index (0.4 ms) once the thread id is known.
     pub fn transcript_path(&self) -> Option<PathBuf> {
         let tid = self.thread_id.as_ref()?;
+        if let Some(source) = &self.source {
+            let indexed = crate::adapter::codex_index::thread_by_id_in(source.home(), tid)
+                .or_else(|| crate::rc::runtime_files::locate(source.home(), tid).ok())?;
+            let path = indexed.rollout_path.canonicalize().ok()?;
+            return path.starts_with(source.home()).then_some(path);
+        }
         crate::adapter::get("codex")
             .ok()?
             .resolve(tid, Some(&self.cwd))
@@ -566,16 +650,20 @@ impl CodexDriver {
             "threadId": tid,
             "input": [{"type":"text","text": message, "text_elements": []}]
         });
-        let model = self
-            .pending_model
-            .as_ref()
-            .map(|p| &p.0)
-            .or(self.model.as_ref());
+        let model = self.pending_model.as_ref().map(|p| &p.0).or_else(|| {
+            (!self.proc.shared())
+                .then_some(self.model.as_ref())
+                .flatten()
+        });
         let effort = self
             .pending_model
             .as_ref()
             .map(|p| p.1.as_ref())
-            .unwrap_or(self.effort.as_ref());
+            .unwrap_or_else(|| {
+                (!self.proc.shared())
+                    .then_some(self.effort.as_ref())
+                    .flatten()
+            });
         if let Some(model) = model {
             params["model"] = json!(model);
         }
@@ -607,9 +695,8 @@ impl CodexDriver {
             .send(&json!({"id": id, "method": "turn/start", "params": params}))
             .await
         {
-            // `write_all` can fail after a prefix reached the child. Retrying
-            // could duplicate both the prompt and sticky mode, so the session
-            // must be retired by the supervisor.
+            // A write can fail after native bytes were accepted. Its outcome
+            // cannot authorize retrying the prompt or a sticky mode override.
             return TurnStartDispatch::Resolved(TurnStartOutcome::Unknown {
                 message: format!("codex turn/start outcome is unknown: {error}"),
                 attempted_mode: staged_mode,
@@ -704,19 +791,75 @@ impl CodexDriver {
             .map_err(|error| format!("codex completed-turn tombstone: {error}"))
     }
 
-    /// Queue a permission-mode change for the next turn.
-    ///
-    /// codex has no live switch — the full `ClientRequest` surface was
-    /// enumerated and there is no `set_permission_mode` equivalent; the policy
-    /// only travels on `thread/*` and `turn/start`. So this stores the intent
-    /// and reports [`PermissionApply::NextTurn`], and the UI says so rather
-    /// than pretending the guard already moved.
+    /// Shared defaults apply to subsequent turns regardless of which client submits them.
     pub async fn set_permission_mode(
         &mut self,
         mode: PermissionMode,
     ) -> PermissionModeChangeResult {
+        if self.proc.shared() {
+            return self.update_shared_permission_mode(mode).await;
+        }
         self.pending_mode = Some(mode);
         Ok(PermissionApply::NextTurn)
+    }
+
+    pub(super) fn shared_executor(&self) -> bool {
+        self.proc.shared()
+    }
+    pub(super) fn permission_mode_known(&self) -> bool {
+        !self.native_mode_unknown
+    }
+
+    async fn update_shared_permission_mode(
+        &mut self,
+        mode: PermissionMode,
+    ) -> PermissionModeChangeResult {
+        use super::PermissionModeChangeError;
+        if self.thread_id.is_none()
+            || self.handshake_request.is_some()
+            || self.pending_turn_start.is_some()
+        {
+            return Err(PermissionModeChangeError::refused(
+                "Wait for native thread and turn acceptance before changing permissions",
+            ));
+        }
+        let (approval, _) = native_policy(mode);
+        match self
+            .command_request(
+                "thread/settings/update",
+                json!({
+                    "threadId": self.thread_id, "approvalPolicy": approval,
+                    "sandboxPolicy": turn_sandbox_policy(mode),
+                }),
+            )
+            .await
+        {
+            Ok(_) => {
+                self.mode = mode;
+                self.native_mode_unknown = false;
+                self.pending_mode = None;
+                Ok(if self.current_turn.is_some() {
+                    PermissionApply::NextTurn
+                } else {
+                    PermissionApply::Immediate
+                })
+            }
+            Err(error)
+                if error
+                    .downcast_ref::<commands::NativeCommandRefusal>()
+                    .is_some()
+                    || super::is_request_id_exhaustion(&error) =>
+            {
+                Err(PermissionModeChangeError::refused(error.to_string()))
+            }
+            Err(error) => {
+                self.native_mode_unknown = true;
+                self.pending_mode = None;
+                Err(PermissionModeChangeError::outcome_unknown(
+                    error.to_string(),
+                ))
+            }
+        }
     }
 
     pub async fn model_control(
@@ -727,6 +870,7 @@ impl CodexDriver {
             self.thread_id.is_some() && self.handshake_request.is_none(),
             "The Codex thread is still opening"
         );
+        self.observe_background_settings();
         if self.model_catalog.is_empty() {
             let mut cursor = Value::Null;
             let mut seen = std::collections::HashSet::new();
@@ -763,8 +907,9 @@ impl CodexDriver {
         }
         if let Some(patch) = patch {
             anyhow::ensure!(
-                self.current_turn.is_none() && self.pending_turn_start.is_none(),
-                "Wait for the current turn before changing model settings"
+                (self.proc.shared() || self.current_turn.is_none())
+                    && self.pending_turn_start.is_none(),
+                "Wait for native turn acceptance before changing model settings"
             );
             let current = self
                 .pending_model
@@ -804,7 +949,35 @@ impl CodexDriver {
                     .map(|p| p.1.clone())
                     .unwrap_or_else(|| self.effort.clone()),
             };
-            self.pending_model = Some((model, effort));
+            if self.proc.shared() {
+                if let Err(error) = self
+                    .command_request(
+                        "thread/settings/update",
+                        json!({
+                            "threadId": self.thread_id, "model": model, "effort": effort,
+                        }),
+                    )
+                    .await
+                {
+                    if error
+                        .downcast_ref::<commands::NativeCommandRefusal>()
+                        .is_none()
+                        && !super::is_request_id_exhaustion(&error)
+                    {
+                        self.native_model_unknown = true;
+                        self.model = None;
+                        self.effort = None;
+                        self.pending_model = None;
+                    }
+                    return Err(error);
+                }
+                self.native_model_unknown = false;
+                self.model = Some(model);
+                self.effort = effort;
+                self.pending_model = None;
+            } else {
+                self.pending_model = Some((model, effort));
+            }
         }
         let desired = self
             .pending_model
@@ -814,13 +987,53 @@ impl CodexDriver {
         let selected = super::models::selected(&self.model_catalog, desired);
         let efforts = super::models::efforts(selected);
         Ok(
-            json!({"model":self.model,"effort":self.effort,"effort_known":self.effort.is_some(),
+            json!({"control":self.control_snapshot(),"model":self.model,"effort":self.effort,"effort_known":self.effort.is_some(),"settings_unknown":self.native_model_unknown,
             "pending":self.pending_model.as_ref().map(|p| json!({"model":p.0,"effort":p.1})),
-            "models":self.model_catalog,"efforts":efforts,"applied":if self.pending_model.is_some() {"next_turn"} else {"immediate"},
+            "models":self.model_catalog,"efforts":efforts,"applied":if self.pending_model.is_some() || (self.proc.shared() && self.current_turn.is_some()) {"next_turn"} else {"immediate"},
             "capabilities":{"model":true,"effort":efforts.as_array().is_some_and(|v| !v.is_empty()),
                 "reset_model":self.default_model.as_deref().is_some_and(|id| super::models::selected(&self.model_catalog, Some(id)).is_some()),
                 "reset_effort":selected.is_some_and(|v| v["default_effort"].is_string())}}),
         )
+    }
+
+    fn observe_thread_settings(&mut self, value: &Value) -> Option<HarnessEvent> {
+        let settings = crate::rc::native_settings::thread_settings(value);
+        if settings.permission_mode.is_none() && !self.proc.shared() {
+            return Some(self.turn_identity_invariant(
+                "Codex changed to an unsupported native permission policy",
+            ));
+        }
+        // An unconfirmed write cannot be cleared by notifications already buffered before it.
+        let mode = (!self.native_mode_unknown)
+            .then_some(settings.permission_mode)
+            .flatten();
+        if value["cwd"]
+            .as_str()
+            .is_some_and(|cwd| std::path::Path::new(cwd) != self.cwd)
+        {
+            return Some(self.turn_identity_invariant(
+                "Codex changed the conversation directory; reconnect to validate its workspace binding"
+            ));
+        }
+        let model = settings.model();
+        if !self.native_model_unknown {
+            self.model = model["model"].as_str().map(str::to_owned);
+            self.effort = model["effort"].as_str().map(str::to_owned);
+        }
+        self.native_mode_unknown = mode.is_none();
+        if let Some(mode) = mode {
+            self.mode = mode;
+        }
+        self.pending_mode = None;
+        self.pending_model = None;
+        Some(HarnessEvent::SettingsUpdated {
+            mode,
+            applied: if self.current_turn.is_some() {
+                PermissionApply::NextTurn
+            } else {
+                PermissionApply::Immediate
+            },
+        })
     }
 
     fn confirm_model_settings(&mut self) {
@@ -965,6 +1178,9 @@ impl CodexDriver {
     }
 
     pub async fn interrupt(&mut self) -> crate::Result<()> {
+        if self.proc.shared() {
+            return self.interrupt_shared().await;
+        }
         // `current_turn == None` does not always mean "nothing is running": in the window
         // where `turn/start` has been written to native stdin and its response has not come
         // back (at most TURN_START_RESPONSE_TIMEOUT), the turn is most likely already
@@ -989,6 +1205,48 @@ impl CodexDriver {
             .await
     }
 
+    async fn interrupt_shared(&mut self) -> crate::Result<()> {
+        let thread = self
+            .thread_id
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("the shared native conversation is still opening"))?;
+        // Other subscribers may start or finish a turn before buffered events reach RC.
+        // Select the current native turn, then let its exact ID fence the interrupt.
+        let page = self
+            .command_request(
+                "thread/turns/list",
+                json!({
+                    "threadId":thread,"limit":1,"itemsView":"notLoaded","sortDirection":"desc"
+                }),
+            )
+            .await?;
+        let turns = page["data"].as_array().ok_or_else(|| {
+            anyhow::anyhow!("Codex omitted current turn state; interrupt was not sent")
+        })?;
+        anyhow::ensure!(
+            turns.len() <= 1,
+            "Codex returned ambiguous current turn state"
+        );
+        let Some(turn) = turns.first() else {
+            return Ok(());
+        };
+        match turn["status"].as_str() {
+            Some("completed" | "interrupted" | "failed") => return Ok(()),
+            Some("inProgress") => {}
+            _ => anyhow::bail!("Codex returned unknown current turn state; interrupt was not sent"),
+        }
+        let turn_id = turn["id"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("Codex omitted its current turn identity"))?;
+        validate_native_turn_id(turn_id).map_err(anyhow::Error::msg)?;
+        self.command_request(
+            "turn/interrupt",
+            json!({"threadId":thread,"turnId":turn_id}),
+        )
+        .await?;
+        Ok(())
+    }
+
     pub fn abandon_pending_approvals(&mut self) -> usize {
         let abandoned = self.pending_approvals.len();
         self.pending_approvals.clear();
@@ -996,26 +1254,13 @@ impl CodexDriver {
     }
 
     pub async fn answer_approval(&mut self, r: &ApprovalResponse) -> ApprovalOutcome {
-        let Some(pending) = self.pending_approvals.remove(&r.approval_id) else {
+        let Some(mut pending) = self.pending_approvals.remove(&r.approval_id) else {
             return ApprovalOutcome::ExplicitRefusal {
-                message: format!(
-                    "approval {} is no longer pending (it timed out or was already answered)",
-                    r.approval_id
-                ),
+                message: format!("approval {} is no longer pending", r.approval_id),
                 retained: false,
             };
         };
-        let req_id = pending.req_id.clone();
-        // Which method asked decides the *shape* of the answer, not just the
-        // decision value.
-        let method = pending.method.clone();
-
-        // `item/permissions/requestApproval` is the odd one out: its result has
-        // **no `decision` field at all** (the schema's required list is
-        // `["permissions"]`). We were answering every method with
-        // `{"decision": …}`, which for this one is a malformed response — the
-        // request then never resolves and the turn hangs.
-        if method == "item/tool/requestUserInput" {
+        let body = if pending.method == "item/tool/requestUserInput" {
             let answers = if r.decision == ApprovalDecision::Allow {
                 r.answers.clone().unwrap_or_default()
             } else {
@@ -1025,68 +1270,33 @@ impl CodexDriver {
                 .into_iter()
                 .map(|(key, value)| (key, json!({"answers":value})))
                 .collect::<serde_json::Map<_, _>>();
-            return match self
-                .send(&json!({"id":req_id,"result":{"answers":answers}}))
-                .await
-            {
-                Ok(()) => ApprovalOutcome::Applied {
-                    effective_mode: None,
-                },
-                Err(error) => ApprovalOutcome::Unknown {
-                    message: format!("codex answer delivery is unknown: {error}"),
-                    attempted_mode: None,
-                },
-            };
-        }
-        if method.starts_with("item/permissions/") {
-            let body = match r.decision {
-                // **Grant the profile from the request unchanged.**
-                //
-                // This response has no decision field (the schema's required list
-                // is only `permissions`), so the profile itself is the only carrier
-                // of what was approved. Returning an empty object grants nothing —
-                // which is exactly how this protocol expresses a refusal, so the
-                // owner presses "allow", codex receives zero authority and can only
-                // keep failing or asking again, while the interface already shows
-                // it as approved.
-                //
-                // What is granted is **the one it asked for**, no more and no less:
-                // whether that overreaches was already decided by `requires_owner`
-                // on the machine side, and the human pressed allow looking at that
-                // same content.
+            json!({"answers":answers})
+        } else if pending.method.starts_with("item/permissions/") {
+            // This method grants the requested profile rather than a decision enum.
+            match r.decision {
                 ApprovalDecision::Allow => json!({
-                    "permissions": pending.requested_permissions.unwrap_or(json!({})),
+                    "permissions": pending.requested_permissions.take().unwrap_or(json!({})),
                     "scope": if r.scope == ApprovalScope::Session { "session" } else { "turn" }
                 }),
-                // Granting nothing is how a refusal is expressed here; there is
-                // no "deny" value to send.
                 ApprovalDecision::Deny => json!({"permissions": {}, "scope": "turn"}),
+            }
+        } else {
+            let decision = match (r.decision, r.scope) {
+                (ApprovalDecision::Allow, ApprovalScope::Session) => "acceptForSession",
+                (ApprovalDecision::Allow, _) => "accept",
+                (ApprovalDecision::Deny, _) => "decline",
             };
-            return match self.send(&json!({"id": req_id, "result": body})).await {
-                Ok(()) => ApprovalOutcome::Applied {
-                    effective_mode: None,
-                },
-                Err(error) => ApprovalOutcome::Unknown {
-                    message: format!("codex approval outcome is unknown: {error}"),
-                    attempted_mode: None,
-                },
-            };
-        }
-
-        let decision = match (r.decision, r.scope) {
-            // "Allow, and stop asking" is a first-class decision value here
-            // rather than a mode change — codex caches it per session itself.
-            (ApprovalDecision::Allow, ApprovalScope::Session) => "acceptForSession",
-            (ApprovalDecision::Allow, _) => "accept",
-            // `decline` refuses this call but lets the turn continue, which is
-            // what a reviewer saying "not that one" means. `cancel` (abort the
-            // whole turn) is what the interrupt button is for.
-            (ApprovalDecision::Deny, _) => "decline",
+            json!({"decision":decision})
         };
-        match self
-            .send(&json!({"id": req_id, "result": {"decision": decision}}))
-            .await
-        {
+        if self.proc.shared() {
+            let outcome = self.answer_shared_approval(&mut pending, body).await;
+            if matches!(outcome, ApprovalOutcome::AwaitingResolution { .. }) {
+                self.pending_approvals
+                    .insert(r.approval_id.clone(), pending);
+            }
+            return outcome;
+        }
+        match self.send(&json!({"id":pending.req_id,"result":body})).await {
             Ok(()) => ApprovalOutcome::Applied {
                 effective_mode: None,
             },
@@ -1097,9 +1307,62 @@ impl CodexDriver {
         }
     }
 
+    async fn answer_shared_approval(
+        &mut self,
+        pending: &mut PendingApproval,
+        body: Value,
+    ) -> ApprovalOutcome {
+        let thread = self.thread_id.clone();
+        let request = pending.req_id.clone();
+        let resolved = |value: &Value| {
+            value["method"] == "serverRequest/resolved"
+                && thread.is_some()
+                && value["params"]["threadId"].as_str() == thread.as_deref()
+                && value["params"].get("requestId") == Some(&request)
+        };
+        if self.pushback.contains_json(resolved) {
+            return ApprovalOutcome::Resolved;
+        }
+        if !pending.response_sent {
+            // Once delivery is attempted, a retry can only observe resolution.
+            pending.response_sent = true;
+            if let Err(error) = self.send(&json!({"id":request,"result":body})).await {
+                return ApprovalOutcome::AwaitingResolution {
+                    message: format!("native approval delivery is unconfirmed: {error}"),
+                };
+            }
+        }
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(750);
+        loop {
+            let queued = match tokio::time::timeout_at(deadline, self.proc.next()).await {
+                Ok(Some(queued)) => queued,
+                _ => return ApprovalOutcome::AwaitingResolution {
+                    message:
+                        "native approval resolution is not confirmed; continue watching the request"
+                            .into(),
+                },
+            };
+            let confirmed = matches!(queued.line(), Line::Json(value) if resolved(value));
+            let closed = matches!(queued.line(), Line::Eof | Line::Fatal(_));
+            self.pushback.push(queued);
+            if confirmed {
+                return ApprovalOutcome::Resolved;
+            }
+            if closed {
+                return ApprovalOutcome::AwaitingResolution {
+                    message: "the native connection closed before confirming approval resolution"
+                        .into(),
+                };
+            }
+        }
+    }
+
     pub async fn next_event(&mut self) -> Option<HarnessEvent> {
         if let Some(ready) = self.opening_ready.take() {
             return Some(ready);
+        }
+        if let Some(event) = self.control_events.pop_front() {
+            return Some(event);
         }
         loop {
             // Release what was held while waiting for the `turn/steer` response first,
@@ -1165,6 +1428,20 @@ impl CodexDriver {
     }
 
     async fn classify(&mut self, v: Value) -> Option<HarnessEvent> {
+        if v.get("method").is_some() {
+            let native = v
+                .pointer("/params/threadId")
+                .or_else(|| v.pointer("/params/thread_id"))
+                .or_else(|| v.pointer("/params/thread/id"))
+                .and_then(Value::as_str);
+            let expected = self.thread_id.as_deref().or(self.resume_from.as_deref());
+            if native
+                .zip(expected)
+                .is_some_and(|(native, expected)| native != expected)
+            {
+                return None;
+            }
+        }
         if let Some(pending) = self.pending_turn_start.as_ref()
             && v.get("method").is_none()
             && v.get("id").and_then(Value::as_i64) == Some(pending.request_id)
@@ -1232,7 +1509,8 @@ impl CodexDriver {
                 TurnStartOutcome::RetryableNotAccepted { .. }
                 | TurnStartOutcome::ConcurrentNotAccepted { .. }
                 | TurnStartOutcome::FatalNotAccepted { .. }
-                | TurnStartOutcome::Unknown { .. } => {}
+                | TurnStartOutcome::Unknown { .. }
+                | TurnStartOutcome::SharedUnknown { .. } => {}
             }
             return Some(HarnessEvent::TurnStartResolved(outcome));
         }
@@ -1384,6 +1662,22 @@ impl CodexDriver {
         }
 
         match method {
+            "serverRequest/resolved"
+                if self.thread_id.is_some()
+                    && params["threadId"].as_str() == self.thread_id.as_deref() =>
+            {
+                let request_id = params.get("requestId")?;
+                let approval_id = self.pending_approvals.iter().find_map(|(key, pending)| {
+                    (&pending.req_id == request_id).then(|| key.clone())
+                })?;
+                self.pending_approvals.remove(&approval_id);
+                Some(HarnessEvent::ApprovalResolved { approval_id })
+            }
+            "thread/settings/updated"
+                if params["threadId"].as_str() == self.thread_id.as_deref() =>
+            {
+                self.observe_thread_settings(&params["threadSettings"])
+            }
             "item/autoApprovalReview/completed"
                 if self.thread_id.is_some()
                     && params["threadId"].as_str() == self.thread_id.as_deref() =>
@@ -1502,7 +1796,8 @@ impl CodexDriver {
                             "codex turn/completed for {id} contradicted active turn {active}"
                         )));
                     }
-                    None if self.pending_turn_start.is_none() => {
+                    // A shared subscriber may miss acceptance while still receiving completion.
+                    None if self.pending_turn_start.is_none() && !self.proc.shared() => {
                         return Some(self.turn_identity_invariant(format!(
                             "codex turn/completed for {id} had no active or pending turn"
                         )));
@@ -1601,6 +1896,13 @@ impl CodexDriver {
         params: &Value,
         req_id: Value,
     ) -> Option<HarnessEvent> {
+        if let (Some(bound), Some(requested)) = (
+            self.thread_id.as_deref(),
+            params.get("threadId").and_then(Value::as_str),
+        ) && bound != requested
+        {
+            return None;
+        }
         let kind = match method {
             "item/commandExecution/requestApproval" => ApprovalKind::Exec,
             "item/fileChange/requestApproval" => ApprovalKind::FileChange,
@@ -1655,9 +1957,14 @@ impl CodexDriver {
                 format!("{item}:{req_id}")
             }
         };
+        let response_sent = self
+            .pending_approvals
+            .get(&approval_id)
+            .is_some_and(|pending| pending.req_id == req_id && pending.response_sent);
         self.pending_approvals.insert(
             approval_id.clone(),
             PendingApproval {
+                response_sent,
                 req_id,
                 method: method.to_string(),
                 // A permission-escalation approval keeps the profile from the
@@ -1742,7 +2049,11 @@ impl CodexDriver {
                 &cwd,
                 &[("AGIT_CODEX_TEST_RESPONSES".into(), responses)],
             )
-            .expect("test responder"),
+            .expect("test responder")
+            .into(),
+            source: None,
+            control: Default::default(),
+            control_events: Default::default(),
             thread_id: thread_id.map(String::from),
             current_turn: None,
             next_id: Some(1),
@@ -1764,6 +2075,8 @@ impl CodexDriver {
             guardian_denials: Default::default(),
             mode: PermissionMode::Default,
             pending_mode: None,
+            native_mode_unknown: false,
+            native_model_unknown: false,
             pending_turn_start: None,
             retired_turn_starts: Default::default(),
             completed_turn_ids: Default::default(),
@@ -1826,6 +2139,281 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn buffered_settings_cannot_confirm_an_uncertain_model_write() {
+        let mut driver = CodexDriver::test_responder(Some("thread"), &[]);
+        driver.native_model_unknown = true;
+        driver.model = None;
+        driver.effort = None;
+        let event = driver.observe_thread_settings(&json!({
+            "model":"stale", "effort":"low", "approvalPolicy":"never",
+            "sandboxPolicy":{"type":"workspace-write"}
+        }));
+        assert!(matches!(event, Some(HarnessEvent::SettingsUpdated { .. })));
+        assert!(driver.native_model_unknown);
+        assert!(driver.model.is_none());
+        assert!(driver.effort.is_none());
+        driver.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn shared_interrupt_requires_current_native_state_and_exact_acknowledgement() {
+        for reply in [
+            json!({"id":2,"result":{}}),
+            json!({"id":2,"error":{"code":-32600,"message":"Turn already completed"}}),
+            json!({"id":2}),
+        ] {
+            let mut driver = CodexDriver::test_responder(
+                Some("thread"),
+                &[
+                    json!({"id":1,"result":{"data":[{"id":"external-turn","status":"inProgress"}]}}),
+                    reply.clone(),
+                ],
+            );
+            assert!(driver.current_turn.is_none());
+            let outcome = driver.interrupt_shared().await;
+            assert_eq!(outcome.is_ok(), reply.get("result").is_some());
+            assert_eq!(driver.next_id, Some(3));
+            driver.shutdown().await.unwrap();
+        }
+        let mut driver = CodexDriver::test_responder(
+            Some("thread"),
+            &[json!({"id":1,"result":{"data":[{"id":"finished","status":"completed"}]}})],
+        );
+        driver.current_turn = Some("stale-turn".into());
+        driver.interrupt_shared().await.unwrap();
+        assert_eq!(
+            driver.next_id,
+            Some(2),
+            "a finished turn receives no interrupt"
+        );
+        driver.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn shared_permissions_update_native_defaults_without_queuing_an_rc_override() {
+        let mut driver =
+            CodexDriver::test_responder(Some("thread"), &[json!({"id":1,"result":{}})]);
+        driver.current_turn = Some("running".into());
+        driver.pending_mode = Some(PermissionMode::Plan);
+        assert_eq!(
+            driver
+                .update_shared_permission_mode(PermissionMode::Auto)
+                .await
+                .unwrap(),
+            PermissionApply::NextTurn
+        );
+        assert_eq!(driver.permission_mode(), PermissionMode::Auto);
+        assert!(driver.pending_mode.is_none());
+        assert!(driver.permission_mode_known());
+        assert_eq!(driver.current_turn.as_deref(), Some("running"));
+        driver.shutdown().await.unwrap();
+
+        let mut driver = CodexDriver::test_responder(
+            Some("thread"),
+            &[json!({"id":1,"error":{"code":-32602,"message":"Policy refused"}})],
+        );
+        assert!(
+            driver
+                .update_shared_permission_mode(PermissionMode::Bypass)
+                .await
+                .unwrap_err()
+                .is_explicit_refusal()
+        );
+        assert!(driver.permission_mode_known());
+        assert_eq!(driver.permission_mode(), PermissionMode::Default);
+        driver.shutdown().await.unwrap();
+
+        let mut driver = CodexDriver::test_responder(Some("thread"), &[json!({"id":1})]);
+        assert!(
+            !driver
+                .update_shared_permission_mode(PermissionMode::Bypass)
+                .await
+                .unwrap_err()
+                .is_explicit_refusal()
+        );
+        assert!(!driver.permission_mode_known());
+        let observation = driver.classify(json!({"method":"thread/settings/updated","params":{
+            "threadId":"thread","threadSettings":{"model":"observed-model","approvalPolicy":"never","sandboxPolicy":{"type":"readOnly"}}
+        }})).await;
+        assert!(matches!(
+            observation,
+            Some(HarnessEvent::SettingsUpdated { mode: None, .. })
+        ));
+        assert_eq!(driver.model.as_deref(), Some("observed-model"));
+        assert!(
+            !driver.permission_mode_known(),
+            "a buffered notification cannot resolve an unconfirmed write"
+        );
+        driver.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn native_settings_notifications_update_only_the_bound_conversation() {
+        let mut driver = CodexDriver::test_responder(Some("thread"), &[]);
+        driver.model = Some("old-model".into());
+        driver.current_turn = Some("running".into());
+        driver.pending_model = Some(("stale-intent".into(), None));
+        driver.pending_mode = Some(PermissionMode::Plan);
+        let mut notification = json!({"method":"thread/settings/updated","params":{
+            "threadId":"other","threadSettings":{"model":"native-model","effort":"high",
+                "approvalPolicy":"never","sandboxPolicy":{"type":"dangerFullAccess"}}
+        }});
+        assert!(driver.classify(notification.clone()).await.is_none());
+        assert_eq!(driver.model.as_deref(), Some("old-model"));
+        notification["params"]["threadId"] = json!("thread");
+        assert!(matches!(
+            driver.classify(notification.clone()).await,
+            Some(HarnessEvent::SettingsUpdated {
+                mode: Some(PermissionMode::Bypass),
+                applied: PermissionApply::NextTurn
+            })
+        ));
+        assert_eq!(driver.model.as_deref(), Some("native-model"));
+        assert_eq!(driver.effort.as_deref(), Some("high"));
+        assert_eq!(driver.permission_mode(), PermissionMode::Bypass);
+        assert!(driver.pending_mode.is_none() && driver.pending_model.is_none());
+        assert_eq!(driver.current_turn.as_deref(), Some("running"));
+        notification["params"]["threadSettings"]["sandboxPolicy"]["type"] = json!("custom");
+        assert!(matches!(
+            driver.classify(notification).await,
+            Some(HarnessEvent::ProtocolInvariant { .. })
+        ));
+        driver.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn shared_approval_waits_for_exact_resolution_without_resending_uncertain_answers() {
+        let pending = || PendingApproval {
+            response_sent: false,
+            req_id: json!(7),
+            method: "item/commandExecution/requestApproval".into(),
+            requested_permissions: None,
+        };
+        let mut driver = probe();
+        driver.thread_id = Some("thread".into());
+        let mut request = pending();
+        assert!(matches!(
+            driver
+                .answer_shared_approval(&mut request, json!({"decision":"accept"}))
+                .await,
+            ApprovalOutcome::AwaitingResolution { .. }
+        ));
+        assert!(matches!(
+            driver
+                .answer_shared_approval(&mut request, json!({"decision":"decline"}))
+                .await,
+            ApprovalOutcome::AwaitingResolution { .. }
+        ));
+        assert!(request.response_sent);
+        assert_eq!(
+            driver.pushback.len(),
+            1,
+            "an uncertain response must not be sent twice"
+        );
+        assert!(
+            driver
+                .pushback
+                .contains_json(|value| value["result"]["decision"] == "accept")
+        );
+        driver.shutdown().await.unwrap();
+
+        let foreign =
+            json!({"method":"serverRequest/resolved","params":{"threadId":"other","requestId":7}});
+        let unrelated = json!({"method":"serverRequest/resolved","params":{"threadId":"thread","requestId":"7"}});
+        let resolved =
+            json!({"method":"serverRequest/resolved","params":{"threadId":"thread","requestId":7}});
+        let mut driver =
+            CodexDriver::test_responder(Some("thread"), &[foreign, unrelated, resolved]);
+        assert!(matches!(
+            driver
+                .answer_shared_approval(&mut pending(), json!({"decision":"accept"}))
+                .await,
+            ApprovalOutcome::Resolved
+        ));
+        assert_eq!(
+            driver.pushback.len(),
+            3,
+            "notifications remain available to the event pump"
+        );
+        let mut already_resolved = pending();
+        assert!(matches!(
+            driver
+                .answer_shared_approval(&mut already_resolved, json!({"decision":"accept"}))
+                .await,
+            ApprovalOutcome::Resolved
+        ));
+        assert!(
+            !already_resolved.response_sent,
+            "a buffered native resolution prevents another answer"
+        );
+        driver.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn shared_approval_resolution_matches_the_bound_thread_and_native_request() {
+        let mut driver = probe();
+        driver.thread_id = Some("thread".into());
+        assert!(driver.classify_server_request(
+            "item/commandExecution/requestApproval",
+            &json!({"threadId":"other","turnId":"turn","approvalId":"foreign","itemId":"same-item"}),
+            json!(7),
+        ).is_none());
+        for (id, request_id) in [("first", json!(7)), ("second", json!("7"))] {
+            assert!(matches!(driver.classify_server_request(
+                "item/commandExecution/requestApproval",
+                &json!({"threadId":"thread","turnId":"turn","approvalId":id,"itemId":"same-item"}),
+                request_id,
+            ), Some(HarnessEvent::Approval(_))));
+        }
+        let notification = |thread, request| {
+            json!({"method":"serverRequest/resolved",
+            "params":{"threadId":thread,"requestId":request}})
+        };
+        assert!(
+            driver
+                .classify(notification("other", json!(7)))
+                .await
+                .is_none()
+        );
+        assert!(
+            driver
+                .classify(notification("thread", json!(8)))
+                .await
+                .is_none()
+        );
+        assert!(
+            matches!(driver.classify(notification("thread", json!(7))).await,
+            Some(HarnessEvent::ApprovalResolved { approval_id }) if approval_id == "first")
+        );
+        assert!(!driver.pending_approvals.contains_key("first"));
+        assert!(driver.pending_approvals.contains_key("second"));
+        assert!(
+            driver
+                .classify(notification("thread", json!(7)))
+                .await
+                .is_none()
+        );
+        assert!(matches!(
+            driver
+                .answer_approval(&ApprovalResponse {
+                    approval_id: "first".into(),
+                    session_id: "test".into(),
+                    decision: ApprovalDecision::Allow,
+                    scope: ApprovalScope::Once,
+                    message: None,
+                    by: None,
+                    answers: None,
+                })
+                .await,
+            ApprovalOutcome::ExplicitRefusal {
+                retained: false,
+                ..
+            }
+        ));
+        driver.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn native_question_answers_use_the_server_request_schema() {
         let mut driver = probe();
         let event = driver.classify_server_request("item/tool/requestUserInput", &json!({"turnId":"turn-1","itemId":"q1","questions":[{"id":"label","question":"Choose a label"}]}), json!(42));
@@ -1863,7 +2451,12 @@ mod tests {
     fn probe() -> CodexDriver {
         let cwd = PathBuf::from("/");
         CodexDriver {
-            proc: Proc::spawn("cat", &[], &cwd, &[]).expect("test process"),
+            proc: Proc::spawn("cat", &[], &cwd, &[])
+                .expect("test process")
+                .into(),
+            source: None,
+            control: Default::default(),
+            control_events: Default::default(),
             thread_id: None,
             current_turn: None,
             next_id: Some(1),
@@ -1885,6 +2478,8 @@ mod tests {
             guardian_denials: Default::default(),
             mode: PermissionMode::Default,
             pending_mode: None,
+            native_mode_unknown: false,
+            native_model_unknown: false,
             pending_turn_start: None,
             retired_turn_starts: Default::default(),
             completed_turn_ids: Default::default(),
@@ -2056,7 +2651,8 @@ mod tests {
                 ("AGIT_CODEX_PROMPT_RESPONSE".into(), response.to_string()),
             ],
         )
-        .unwrap();
+        .unwrap()
+        .into();
         driver.thread_id = Some("thread".into());
         driver.current_turn = (!start).then(|| "native-turn".into());
         driver
@@ -2230,6 +2826,7 @@ mod tests {
                 driver.pending_approvals.insert(
                     "approval-1".into(),
                     PendingApproval {
+                        response_sent: false,
                         req_id: json!(7),
                         method: "item/commandExecution/requestApproval".into(),
                         requested_permissions: None,
@@ -2953,6 +3550,7 @@ mod tests {
         driver.pending_approvals.insert(
             "approval-live".into(),
             PendingApproval {
+                response_sent: false,
                 req_id: json!(5),
                 method: "item/commandExecution/requestApproval".into(),
                 requested_permissions: None,

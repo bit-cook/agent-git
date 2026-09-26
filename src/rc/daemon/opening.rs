@@ -9,6 +9,7 @@ const LAUNCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 pub(super) struct LaunchReservation {
     pub(super) generation: u64,
     pub(super) runtime: String,
+    pub(super) native_source: Option<crate::protocol::NativeSourceRef>,
     pub(super) native_id: Option<String>,
 }
 
@@ -208,7 +209,7 @@ impl Daemon {
                 self.prepare_start_session(frame.params_as()?, &caller, frames, &frame.authority)
             }
             method::SESSION_RESUME => {
-                self.prepare_resume_session(frame.params_as()?, &caller, frames)
+                self.prepare_resume_session(frame.params_as()?, &caller, frames, &frame.authority)
             }
             _ => Err(RpcError::new(
                 ErrorCode::UnknownMethod,
@@ -226,8 +227,12 @@ impl Daemon {
         info: &SessionInfo,
         spec: &LaunchSpec,
     ) -> Result<(), SpawnFailure> {
-        let native_conflict = |runtime: &str, native: Option<&str>| {
+        let native_conflict = |runtime: &str,
+                               source: Option<&crate::protocol::NativeSourceRef>,
+                               native: Option<&str>| {
             runtime == info.runtime
+                && source.map(|source| &source.source_id)
+                    == info.native_source.as_ref().map(|source| &source.source_id)
                 && spec
                     .resume_from
                     .as_deref()
@@ -235,14 +240,20 @@ impl Daemon {
         };
         if self.sessions.contains_key(&info.session_id)
             || self.opening_sessions.contains_key(&info.session_id)
-            || self
-                .sessions
-                .values()
-                .any(|live| native_conflict(&live.info.runtime, live.runtime_thread_id.as_deref()))
-            || self
-                .opening_sessions
-                .values()
-                .any(|opening| native_conflict(&opening.runtime, opening.native_id.as_deref()))
+            || self.sessions.values().any(|live| {
+                native_conflict(
+                    &live.info.runtime,
+                    live.info.native_source.as_ref(),
+                    live.runtime_thread_id.as_deref(),
+                )
+            })
+            || self.opening_sessions.values().any(|opening| {
+                native_conflict(
+                    &opening.runtime,
+                    opening.native_source.as_ref(),
+                    opening.native_id.as_deref(),
+                )
+            })
         {
             return Err(SpawnFailure::before_launch(RpcError::new(
                 ErrorCode::SessionBusy,
@@ -307,6 +318,7 @@ impl Daemon {
                 return Err(failure);
             }
         };
+        let info = session.info.clone();
         self.latest_session_generations
             .insert(session_id.clone(), generation);
         self.journal.resume(&session_id);
@@ -423,6 +435,7 @@ mod tests {
         let cwd = state.mirror.bind("ws", "project", dir.path()).unwrap();
         let info = SessionInfo {
             session_id: "agit-opening".into(),
+            native_source: None,
             runtime_session_id: None,
             workspace_id: "ws".into(),
             project_id: Some("project".into()),
@@ -480,6 +493,36 @@ mod tests {
         assert!(state.require_launch_slot(&alias, &spec).is_err());
         spec.resume_from = Some("different-native".into());
         assert!(state.require_launch_slot(&alias, &spec).is_ok());
+    }
+
+    #[tokio::test]
+    async fn launch_reservations_distinguish_sources_but_not_their_generations() {
+        let (_dir, daemon, spawn) = fixture().await;
+        let mut state = daemon.lock().await;
+        let source = crate::protocol::NativeSourceRef {
+            source_id: "alpha".into(),
+            generation: 1,
+        };
+        let reserved = state
+            .opening_sessions
+            .get_mut(&spawn.info.session_id)
+            .unwrap();
+        reserved.native_source = Some(source.clone());
+        reserved.native_id = Some("copied-native".into());
+        let mut alias = spawn.info.clone();
+        alias.session_id = "other-logical".into();
+        alias.native_source = Some(source);
+        let mut spec = spawn.spec.clone();
+        spec.resume_from = Some("copied-native".into());
+        assert!(state.require_launch_slot(&alias, &spec).is_err());
+        alias.native_source.as_mut().unwrap().generation = 2;
+        assert!(state.require_launch_slot(&alias, &spec).is_err());
+        alias.native_source.as_mut().unwrap().source_id = "beta".into();
+        assert!(state.require_launch_slot(&alias, &spec).is_ok());
+        alias.native_source = None;
+        assert!(state.require_launch_slot(&alias, &spec).is_ok());
+        alias.session_id = spawn.info.session_id;
+        assert!(state.require_launch_slot(&alias, &spec).is_err());
     }
 
     /// Waiting for one harness leaves daemon state available, including other launch slots.

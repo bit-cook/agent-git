@@ -133,6 +133,7 @@ mod tests {
             LaunchReservation {
                 generation: 2,
                 runtime: "codex".into(),
+                native_source: None,
                 native_id: None,
             },
         );

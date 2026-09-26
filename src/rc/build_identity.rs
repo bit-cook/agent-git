@@ -4,7 +4,14 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 pub const BUILD_ID: &str = env!("AGIT_BUILD_ID");
-pub const RPC_FEATURES: &[&str] = &["peer-control-v1", "history-v2", "safe-restart-v1"];
+pub const RPC_FEATURES: &[&str] = &[
+    "peer-control-v1",
+    "history-v2",
+    "safe-restart-v1",
+    "source-catalog-v1",
+    "source-catalog-resolve-v1",
+    "source-catalog-delta-v1",
+];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DaemonIdentity {

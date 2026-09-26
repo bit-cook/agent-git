@@ -26,6 +26,7 @@ pub(super) struct PreparedWatch {
     cwd: PathBuf,
     protection_repo: Option<PathBuf>,
     source: WatchSource,
+    enrolled: Option<super::source_watch::SourceWatch>,
     seed: Option<Frame>,
     from_line: u64,
     total_lines: u64,
@@ -53,6 +54,23 @@ impl WatchScan {
     pub(super) fn run(self) -> Result<PreparedWatch, RpcError> {
         let Self { request, snapshot } = self;
         let roots = snapshot.roots.clone();
+        if let Some(enrolled) =
+            super::source_watch::SourceWatch::resolve(&request.session_id, &roots)
+                .map_err(source_sessions::unavailable)?
+        {
+            let local = LocalSession {
+                runtime_session_id: request.session_id.clone(),
+                runtime: "codex".into(),
+                cwd: enrolled.cwd.to_string_lossy().into(),
+                modified_at: String::new(),
+                gist: None,
+                title: None,
+                adopted: false,
+                agent: None,
+                likely_active: false,
+            };
+            return Self::prepare_source_with_context(request, roots, local, Some(enrolled));
+        }
         let local = snapshot
             .scan(LocalSessionScan::Locate)
             .into_iter()
@@ -71,6 +89,15 @@ impl WatchScan {
         request: SessionWatch,
         roots: policy::CanonicalRoots,
         local: LocalSession,
+    ) -> Result<PreparedWatch, RpcError> {
+        Self::prepare_source_with_context(request, roots, local, None)
+    }
+
+    fn prepare_source_with_context(
+        request: SessionWatch,
+        roots: policy::CanonicalRoots,
+        local: LocalSession,
+        enrolled: Option<super::source_watch::SourceWatch>,
     ) -> Result<PreparedWatch, RpcError> {
         let runtime = local.runtime;
         let cwd = policy::require_within(Path::new(&local.cwd), &roots)
@@ -107,8 +134,10 @@ impl WatchScan {
         } else {
             let adapter = crate::adapter::get(&runtime)
                 .map_err(|error| RpcError::new(ErrorCode::RuntimeUnavailable, error.to_string()))?;
-            let path = adapter
-                .resolve(&request.session_id, Some(&cwd))
+            let path = enrolled
+                .as_ref()
+                .map(|watch| watch.path.clone())
+                .or_else(|| adapter.resolve(&request.session_id, Some(&cwd)))
                 .ok_or_else(|| {
                     RpcError::new(
                         ErrorCode::SessionNotFound,
@@ -153,9 +182,14 @@ impl WatchScan {
             _ => None,
         };
         let settings = match &source {
-            WatchSource::File { path, .. } if runtime == "codex" => Some(
-                crate::rc::native_settings::read_codex(path, &request.session_id),
-            ),
+            WatchSource::File { path, .. } if runtime == "codex" => Some(match &enrolled {
+                Some(watch) => crate::rc::native_settings::read_codex_in(
+                    &watch.context.source.home,
+                    path,
+                    &watch.native_id,
+                ),
+                None => crate::rc::native_settings::read_codex(path, &request.session_id),
+            }),
             _ => None,
         };
         Ok(PreparedWatch {
@@ -165,6 +199,7 @@ impl WatchScan {
             cwd,
             protection_repo,
             source,
+            enrolled,
             seed,
             from_line,
             total_lines,
@@ -225,6 +260,7 @@ impl Daemon {
             cwd,
             protection_repo,
             source,
+            enrolled,
             seed,
             from_line,
             total_lines,
@@ -249,6 +285,11 @@ impl Daemon {
                 "workspace folders changed while opening this session; refresh the list",
             ));
         }
+        if let Some(watch) = &enrolled {
+            watch
+                .validate(&roots)
+                .map_err(source_sessions::unavailable)?;
+        }
         let current_cwd = policy::require_within(&cwd, &roots)
             .map_err(|error| RpcError::new(ErrorCode::PathNotAllowed, error.to_string()))?;
         if current_cwd != cwd {
@@ -257,11 +298,10 @@ impl Daemon {
                 "session folder changed while opening it",
             ));
         }
-        if self
-            .sessions
-            .values()
-            .any(|session| session.runtime_thread_id.as_deref() == Some(p.session_id.as_str()))
-        {
+        if self.sessions.values().any(|session| {
+            session.info.native_source.is_none()
+                && session.runtime_thread_id.as_deref() == Some(p.session_id.as_str())
+        }) {
             return Err(RpcError::new(
                 ErrorCode::SessionBusy,
                 "session is now supervised by this machine; refresh the list",
@@ -284,7 +324,13 @@ impl Daemon {
         let now = chrono::Utc::now().to_rfc3339();
         let info = SessionInfo {
             session_id: watch_id.clone(),
-            runtime_session_id: Some(p.session_id.clone()),
+            native_source: enrolled.as_ref().map(|watch| watch.identity()),
+            runtime_session_id: Some(
+                enrolled
+                    .as_ref()
+                    .map(|watch| watch.native_id.clone())
+                    .unwrap_or_else(|| p.session_id.clone()),
+            ),
             workspace_id: p.workspace_id.clone(),
             project_id,
             runtime: runtime.clone(),
@@ -301,14 +347,28 @@ impl Daemon {
             // The roster keys on the logical `agit-*` id while `session.watch` receives a
             // harness-native thread id. Looking the latter up directly always lands on
             // "no such row" and misses the real monotonic danger bit.
-            dangerous: danger::judge(
-                &self.roster,
-                &runtime,
-                &p.session_id,
-                &p.workspace_id,
-                &cwd.to_string_lossy(),
-            )
-            .ever_dangerous(),
+            dangerous: match &enrolled {
+                Some(watch) => {
+                    self.roster.transcript_ever_dangerous_in(
+                        &runtime,
+                        Some(&watch.context.source.source_id),
+                        &watch.native_id,
+                        &p.workspace_id,
+                        &cwd.to_string_lossy(),
+                    ) || settings
+                        .as_ref()
+                        .and_then(|settings| settings.permission_mode)
+                        .is_none_or(|mode| mode.is_dangerous())
+                }
+                None => danger::judge(
+                    &self.roster,
+                    &runtime,
+                    &p.session_id,
+                    &p.workspace_id,
+                    &cwd.to_string_lossy(),
+                )
+                .ever_dangerous(),
+            },
             permission_mode: settings
                 .as_ref()
                 .and_then(|settings| settings.permission_mode),
@@ -330,6 +390,16 @@ impl Daemon {
         if stale {
             self.take_watch(&watch_id);
         }
+        if self
+            .watches
+            .get(&watch_id)
+            .is_some_and(|watch| watch.info.native_source != info.native_source)
+        {
+            return Err(RpcError::new(
+                ErrorCode::SessionBusy,
+                "the prior runtime source watch is detaching; retry the updated source",
+            ));
+        }
         // A read-only follow and a supervised session take the same outbound
         // path, so they share the daemon's secret filter: loading a copy here
         // freezes a snapshot on this stream, which keeps allowing by the old
@@ -347,7 +417,12 @@ impl Daemon {
                     "session protection context is unavailable",
                 )
             })?;
-            redactor = redactor.with_native_context(&runtime, &request.session_id, &cwd, root);
+            let native_id = enrolled
+                .as_ref()
+                .map(|watch| watch.native_id.as_str())
+                .unwrap_or(&request.session_id);
+            redactor = redactor.with_native_context(&runtime, native_id, &cwd, root);
+            redactor = redactor.with_native_source(enrolled.as_ref().map(|watch| watch.identity()));
         }
         let model_settings = settings
             .as_ref()
@@ -378,6 +453,7 @@ impl Daemon {
                 let notes = self.notes.clone();
                 let stream = watch_id.clone();
                 let rt = runtime.clone();
+                let workspace = caller.workspace_id.clone();
                 let handle = tokio::spawn(async move {
                     // Read from the start of the window instead of reading from the
                     // beginning and discarding — the latter costs memory the size of
@@ -409,16 +485,33 @@ impl Daemon {
                     // the journal's ring, and a viewer replays them with a
                     // `session.subscribe`.
                     tokio::time::sleep(WATCH_RESPONSE_HEADSTART).await;
-                    if let Some(mut frame) = seed {
-                        frame.stream = Some(stream.clone());
-                        if frames.send(frame).await.is_err() {
-                            return;
-                        }
-                    }
+                    let mut seed = seed;
                     let mut native_records =
                         crate::rc::supervisor::native_records::NativeRecords::default();
                     let mut initial = true;
                     loop {
+                        if let Some(watch) = &enrolled {
+                            let watch = watch.clone();
+                            let workspace = workspace.clone();
+                            if !matches!(
+                                tokio::task::spawn_blocking(move || {
+                                    let roots = crate::rc::mirror::Mirror::load().roots(&workspace);
+                                    watch.validate(&roots)
+                                })
+                                .await,
+                                Ok(Ok(()))
+                            ) {
+                                history_status(&frames, &stream, "failed", Some("source_revoked"))
+                                    .await;
+                                break;
+                            }
+                        }
+                        if let Some(mut frame) = seed.take() {
+                            frame.stream = Some(stream.clone());
+                            if frames.send(frame).await.is_err() {
+                                return;
+                            }
+                        }
                         if let Some(source) = &native_source {
                             let bytes = if let Some(bytes) = initial_snapshot.take() {
                                 bytes
@@ -754,7 +847,10 @@ impl WatchRpcTicket {
                 let mut scanned = scanned;
                 if let Ok(prepared) = &mut scanned
                     && prepared.runtime == "codex"
-                    && let Some(codex) = crate::adapter::which("codex")
+                    && let Some(codex) = prepared.enrolled.as_ref().map_or_else(
+                        || crate::adapter::which("codex"),
+                        |watch| watch.context.source.executable.clone(),
+                    )
                     && crate::rc::native_inbox::queue_available(codex).await
                 {
                     prepared.native_inbox = Some("codex_queue".into());
@@ -815,14 +911,12 @@ fn watch_frames(
                     "settings":redactor.scrub_json(&settings.model()).value
                 }),
             ));
-            if let Some(mode) = settings.permission_mode {
-                frames.push(Frame::notification(
-                    "session.permissionMode",
-                    serde_json::json!({
-                        "mode":mode,"applied":"immediate"
-                    }),
-                ));
-            }
+            frames.push(Frame::notification(
+                "session.permissionMode",
+                serde_json::json!({
+                    "mode":settings.permission_mode,"applied":"immediate"
+                }),
+            ));
         }
         while items.peek().is_some_and(|item| item.line == line.lineno) {
             frames.push(Frame::notification(

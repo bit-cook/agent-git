@@ -131,6 +131,28 @@ pub(super) fn authorize(
     })
 }
 
+pub(super) fn authorize_source(
+    roster: &Roster,
+    caller: &crate::protocol::CallerClaim,
+    source: &str,
+    thread: &str,
+    cwd: &str,
+    mode: Option<crate::protocol::PermissionMode>,
+) -> Result<TranscriptDanger, RpcError> {
+    let dangerous = roster.transcript_ever_dangerous_in(
+        "codex",
+        Some(source),
+        thread,
+        &caller.workspace_id,
+        cwd,
+    ) || mode.is_none_or(|mode| mode == crate::protocol::PermissionMode::Bypass);
+    require_owner_to_drive(Some(caller), dangerous)?;
+    Ok(TranscriptDanger {
+        judged: Some(dangerous),
+        authorized: true,
+    })
+}
+
 /// Stamp the judged bit into this session.
 ///
 /// **Monotonic**: an `info.dangerous` that is already true (a session freshly started with

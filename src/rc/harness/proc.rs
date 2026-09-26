@@ -447,6 +447,15 @@ fn rebuildable(line: &Line) -> bool {
 }
 
 impl Pushback {
+    pub(crate) fn contains_json(&self, predicate: impl Fn(&serde_json::Value) -> bool) -> bool {
+        self.items.iter().any(|item| match item {
+            PushbackItem::Held(queued) => {
+                matches!(queued.line(), Line::Json(value) if predicate(value))
+            }
+            _ => false,
+        })
+    }
+
     pub(crate) fn new() -> Pushback {
         Pushback::with_cap(PUSHBACK_MAX_BYTES)
     }
@@ -689,7 +698,7 @@ fn decode_capped(buf: &[u8]) -> Result<std::borrow::Cow<'_, str>, usize> {
     Ok(decoded)
 }
 
-async fn queue_line(
+pub(crate) async fn queue_line(
     tx: &mpsc::Sender<QueuedLine>,
     budget: &std::sync::Arc<tokio::sync::Semaphore>,
     line: Line,
@@ -1219,6 +1228,20 @@ mod tests {
         drop(proc);
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
         while process_group_exists(pgid) {
+            if tokio::time::Instant::now() >= deadline {
+                let output = std::process::Command::new("ps")
+                    .args(["-axo", "pid=,ppid=,pgid=,stat=,comm="])
+                    .output()
+                    .unwrap();
+                for line in String::from_utf8_lossy(&output.stdout)
+                    .lines()
+                    .filter(|line| {
+                        line.split_whitespace().nth(2) == Some(pgid.to_string().as_str())
+                    })
+                {
+                    eprintln!("owned cleanup process: {line}");
+                }
+            }
             assert!(
                 tokio::time::Instant::now() < deadline,
                 "cancelled harness left a live process group"

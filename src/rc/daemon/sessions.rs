@@ -27,6 +27,7 @@ impl Daemon {
             supervised: self
                 .sessions
                 .values()
+                .filter(|session| session.info.native_source.is_none())
                 .filter_map(|session| session.runtime_thread_id.clone())
                 .collect(),
         }
@@ -68,11 +69,9 @@ impl Daemon {
             .iter()
             .map(|row| ((row.runtime.as_str(), row.runtime_session_id.as_str()), row))
             .collect();
-        for session in self
-            .sessions
-            .values_mut()
-            .filter(|session| session.info.workspace_id == caller.workspace_id)
-        {
+        for session in self.sessions.values_mut().filter(|session| {
+            session.info.workspace_id == caller.workspace_id && session.info.native_source.is_none()
+        }) {
             if let Some(row) = session
                 .runtime_thread_id
                 .as_deref()
@@ -109,6 +108,7 @@ impl Daemon {
         p: SessionResume,
         caller: &crate::protocol::CallerClaim,
         frames: &mpsc::Sender<Frame>,
+        authority: &crate::rc::authority::Guard,
     ) -> Result<SessionOpening, RpcError> {
         if !self.mirror.has_workspace(&p.workspace_id) {
             return Err(RpcError::new(
@@ -140,6 +140,19 @@ impl Daemon {
             ));
         }
         if let Some(info) = self.supervised_in(&p.session_id, caller) {
+            if info.native_source.is_some() {
+                self.session_channel(&info.session_id, caller, Need::Brake)?;
+                let project = info.project_id.as_deref().ok_or_else(|| {
+                    source_sessions::unavailable("session has no project binding")
+                })?;
+                let path = self
+                    .mirror
+                    .project_path(&p.workspace_id, project)
+                    .ok_or_else(|| {
+                        source_sessions::unavailable("session project is no longer bound")
+                    })?;
+                authority.check_project(project, &path)?;
+            }
             return Ok(SessionOpening::Ready(
                 serde_json::to_value(SessionResumeResult {
                     session: self.stamped(info),
@@ -153,6 +166,16 @@ impl Daemon {
         // joins the two ids back together and the session keeps one logical identity — for the
         // web, "the daemon restarted" does not exist.
         if let Some(entry) = self.roster.get(&p.session_id).cloned() {
+            if let Some(source) = &entry.native_source {
+                return self.prepare_source_resume(
+                    p,
+                    caller,
+                    frames,
+                    (&source.source_id, &entry.thread_id),
+                    Some(entry.clone()),
+                    authority,
+                );
+            }
             // Tenant boundary: a session resumes only from the workspace it is registered
             // under. Comparing cwd alone is not enough — the same directory (or a subdirectory
             // of it) can be bound once by each of two workspaces, and then B's request takes A's
@@ -244,6 +267,7 @@ impl Daemon {
             let now = chrono::Utc::now().to_rfc3339();
             let info = SessionInfo {
                 session_id: p.session_id.clone(),
+                native_source: None,
                 runtime_session_id: None,
                 workspace_id: p.workspace_id.clone(),
                 project_id: entry.project_id.clone(),
@@ -286,6 +310,22 @@ impl Daemon {
         // `local_sessions` for liveness and then letting `locate_local` scan again from scratch
         // puts both passes under the daemon's global mutex and opens the same Claude transcripts
         // for a gist twice. The internal locate needs no gist at all.
+        if p.session_id.starts_with("local-") && p.session_id.len() == 70 {
+            let row = crate::rc::runtime_catalog::Catalog::open()
+                .and_then(|catalog| catalog.lookup(&p.session_id))
+                .map_err(source_sessions::unavailable)?
+                .ok_or_else(|| {
+                    source_sessions::unavailable("conversation is no longer cataloged")
+                })?;
+            return self.prepare_source_resume(
+                p,
+                caller,
+                frames,
+                (&row.source_id, &row.native_session_id),
+                None,
+                authority,
+            );
+        }
         let local = self.locate_local(&p.workspace_id, &p.session_id)?;
         self.prepare_local_takeover(local, p, caller, frames)
     }
@@ -427,6 +467,7 @@ impl Daemon {
         let now = chrono::Utc::now().to_rfc3339();
         let info = SessionInfo {
             session_id: logical,
+            native_source: None,
             runtime_session_id: None,
             workspace_id: p.workspace_id.clone(),
             project_id,
@@ -483,56 +524,126 @@ impl Daemon {
         frame: &Frame,
         local: Option<LocalSession>,
     ) -> Result<crate::rc::native_inbox::Prepared, RpcError> {
+        self.prepare_inbox_target(frame, local, None)
+    }
+
+    pub(super) fn prepare_inbox_target(
+        &self,
+        frame: &Frame,
+        local: Option<LocalSession>,
+        enrolled: Option<super::source_watch::SourceWatch>,
+    ) -> Result<crate::rc::native_inbox::Prepared, RpcError> {
         let caller = caller_scope(frame)?;
         require_role(&caller, method::SESSION_ENQUEUE)?;
-        let request: crate::rc::native_inbox::Request = frame.params_as()?;
+        let mut request: crate::rc::native_inbox::Request = frame.params_as()?;
         request
-            .validate()
+            .validate_message()
             .map_err(|error| RpcError::new(ErrorCode::MalformedFrame, error.to_string()))?;
-        let local = local
-            .filter(|local| local.runtime_session_id == request.session_id)
-            .ok_or_else(|| {
-                RpcError::new(ErrorCode::SessionNotFound, "native session is unavailable")
-            })?;
-        if local.runtime != "codex" {
-            return Err(RpcError::new(
-                ErrorCode::RuntimeUnavailable,
-                "this runtime does not offer a native inbox",
-            ));
-        }
-        let cwd = policy::require_within(
-            Path::new(&local.cwd),
-            &self.mirror.roots(&request.workspace_id),
-        )
-        .map_err(|error| RpcError::new(ErrorCode::PathNotAllowed, error.to_string()))?;
-        let _ = danger::authorize(
-            &self.roster,
-            &caller,
-            "codex",
-            &request.session_id,
-            &request.workspace_id,
-            &cwd.to_string_lossy(),
-        )?;
-        let transcript = {
-            use crate::adapter::Adapter;
-            crate::adapter::codex::Codex
-                .resolve(&request.session_id, Some(&cwd))
+        frame.authority.check()?;
+        let (cwd, transcript, codex, source) = if let Some(watch) = enrolled {
+            use super::source_sessions::unavailable;
+            if watch.context.source.session_ref(&watch.native_id) != request.session_id {
+                return Err(unavailable("native inbox reference changed"));
+            }
+            for (field, expected) in [
+                (
+                    "source_id",
+                    serde_json::json!(watch.context.source.source_id),
+                ),
+                (
+                    "source_generation",
+                    serde_json::json!(watch.context.source.generation),
+                ),
+                ("native_session_id", serde_json::json!(watch.native_id)),
+                ("expected_cwd", serde_json::json!(watch.cwd)),
+            ] {
+                if frame
+                    .params
+                    .as_ref()
+                    .and_then(|params| params.get(field))
+                    .is_some_and(|value| value != &expected)
+                {
+                    return Err(unavailable("native inbox coordinates changed"));
+                }
+            }
+            watch
+                .validate(&self.mirror.roots(&request.workspace_id))
+                .map_err(unavailable)?;
+            let thread = watch
+                .context
+                .locate(&watch.native_id, &self.mirror.roots(&request.workspace_id))
+                .map_err(unavailable)?;
+            let settings = watch.context.settings(&thread).map_err(unavailable)?;
+            let _ = danger::authorize_source(
+                &self.roster,
+                &caller,
+                &watch.context.source.source_id,
+                &watch.native_id,
+                &watch.cwd.to_string_lossy(),
+                settings.permission_mode,
+            )?;
+            let native = watch.context.source.native().map_err(unavailable)?;
+            request.session_id = watch.native_id;
+            (
+                watch.cwd,
+                watch.path,
+                native.executable().to_path_buf(),
+                Some(watch.context),
+            )
+        } else {
+            request
+                .validate()
+                .map_err(|error| RpcError::new(ErrorCode::MalformedFrame, error.to_string()))?;
+            let local = local
+                .filter(|local| local.runtime_session_id == request.session_id)
                 .ok_or_else(|| {
-                    RpcError::new(
-                        ErrorCode::SessionNotFound,
-                        "cannot locate this Codex transcript",
-                    )
-                })?
+                    RpcError::new(ErrorCode::SessionNotFound, "native session is unavailable")
+                })?;
+            if local.runtime != "codex" {
+                return Err(RpcError::new(
+                    ErrorCode::RuntimeUnavailable,
+                    "this runtime does not offer a native inbox",
+                ));
+            }
+            let cwd = policy::require_within(
+                Path::new(&local.cwd),
+                &self.mirror.roots(&request.workspace_id),
+            )
+            .map_err(|error| RpcError::new(ErrorCode::PathNotAllowed, error.to_string()))?;
+            let _ = danger::authorize(
+                &self.roster,
+                &caller,
+                "codex",
+                &request.session_id,
+                &request.workspace_id,
+                &cwd.to_string_lossy(),
+            )?;
+            let transcript = {
+                use crate::adapter::Adapter;
+                crate::adapter::codex::Codex
+                    .resolve(&request.session_id, Some(&cwd))
+                    .ok_or_else(|| {
+                        RpcError::new(
+                            ErrorCode::SessionNotFound,
+                            "cannot locate this Codex transcript",
+                        )
+                    })?
+            };
+            let codex = crate::adapter::which("codex")
+                .and_then(|path| path.canonicalize().ok())
+                .ok_or_else(|| {
+                    RpcError::new(ErrorCode::RuntimeUnavailable, "Codex CLI is unavailable")
+                })?;
+            (cwd, transcript, codex, None)
         };
-        let codex = crate::adapter::which("codex")
-            .and_then(|path| path.canonicalize().ok())
-            .ok_or_else(|| {
-                RpcError::new(ErrorCode::RuntimeUnavailable, "Codex CLI is unavailable")
-            })?;
         let receipts = crate::rc::rc_dir()
             .map_err(|error| RpcError::new(ErrorCode::Internal, error.to_string()))?
             .join("native-inbox");
         Ok(crate::rc::native_inbox::Prepared {
+            source,
+            authority: frame.authority.clone(),
+            confinement: None,
+            allow_dangerous: caller.is_owner(),
             request,
             transcript,
             cwd,
@@ -699,6 +810,13 @@ impl Daemon {
         let now = chrono::Utc::now().to_rfc3339();
         let info = SessionInfo {
             session_id: session_id.clone(),
+            native_source: if p.runtime == "codex" {
+                crate::rc::runtime_sources::Registry::open()
+                    .and_then(|registry| registry.default_for_launch())
+                    .map_err(source_sessions::unavailable)?
+            } else {
+                None
+            },
             runtime_session_id: None,
             workspace_id: p.workspace_id.clone(),
             project_id: Some(p.project_id.clone()),
@@ -928,25 +1046,33 @@ impl Daemon {
         if info.dangerous {
             let inserted = self.roster.get(&session_id).is_none();
             if inserted {
-                self.roster.record(
-                    &session_id,
-                    roster::Entry {
-                        runtime: info.runtime.clone(),
-                        thread_id: spec.resume_from.clone().unwrap_or_default(),
-                        cwd: spec.cwd.to_string_lossy().into_owned(),
-                        workspace_id: info.workspace_id.clone(),
-                        project_id: info.project_id.clone(),
-                        agit_session: spec.agit_session.as_ref().map(ToString::to_string),
-                        expected_agent_id: spec
-                            .agit_session
-                            .as_ref()
-                            .map(|lineage| lineage.agent_id().to_string()),
-                        permission_mode: info.permission_mode,
-                        guard_attempts: Default::default(),
-                        prior_threads: vec![],
-                        ever_dangerous: true,
-                    },
-                );
+                self.roster
+                    .record(
+                        &session_id,
+                        roster::Entry {
+                            native_source: info.native_source.clone(),
+                            runtime: info.runtime.clone(),
+                            thread_id: spec.resume_from.clone().unwrap_or_default(),
+                            cwd: spec.cwd.to_string_lossy().into_owned(),
+                            workspace_id: info.workspace_id.clone(),
+                            project_id: info.project_id.clone(),
+                            agit_session: spec.agit_session.as_ref().map(ToString::to_string),
+                            expected_agent_id: spec
+                                .agit_session
+                                .as_ref()
+                                .map(|lineage| lineage.agent_id().to_string()),
+                            permission_mode: info.permission_mode,
+                            guard_attempts: Default::default(),
+                            prior_threads: vec![],
+                            ever_dangerous: true,
+                        },
+                    )
+                    .map_err(|error| {
+                        SpawnFailure::before_launch(RpcError::new(
+                            ErrorCode::Internal,
+                            error.to_string(),
+                        ))
+                    })?;
             }
             // This row is **already** in the ledger (the resume-by-logical-id path lands here):
             // merge the judged bit into it, persisted before launch just the same.
@@ -1001,6 +1127,7 @@ impl Daemon {
             LaunchReservation {
                 generation,
                 runtime: info.runtime.clone(),
+                native_source: info.native_source.clone(),
                 native_id: spec.resume_from.clone(),
             },
         );

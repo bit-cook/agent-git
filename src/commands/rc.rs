@@ -5,6 +5,8 @@
 //! renders. Every error ends in a command the user can run — an error without a
 //! next step is a bug (see the CLI conventions in `commands/mod.rs`).
 
+mod sources;
+
 use super::CmdResult;
 use crate::rc::control;
 use crate::{ExitCode, ui};
@@ -19,6 +21,8 @@ pub struct Args {
 
 #[derive(Subcommand)]
 pub enum Action {
+    /// Register and inspect native runtime homes on this device.
+    Sources(sources::SourceArgs),
     /// Carry transport packets for the supervising daemon.
     #[command(hide = true)]
     Tunnel,
@@ -84,9 +88,64 @@ pub struct LandArgs {
     /// The harness-native session/thread id.
     #[arg(long, value_name = "id")]
     pub session: String,
+    /// Registered native source identity, paired with its captured generation.
+    #[arg(long, requires = "source_generation")]
+    pub source_id: Option<String>,
+    #[arg(long, requires = "source_id")]
+    pub source_generation: Option<u64>,
     /// The project working directory.
     #[arg(long, value_name = "dir")]
     pub cwd: String,
+}
+
+impl LandArgs {
+    fn native_binding(&self) -> crate::Result<Option<crate::domain::link::NativeBinding>> {
+        match (&self.source_id, self.source_generation) {
+            (None, None) => Ok(None),
+            (Some(id), Some(generation)) => {
+                anyhow::ensure!(self.runtime == "codex", "native sources require Codex");
+                let binding = crate::domain::link::NativeBinding {
+                    source: crate::protocol::NativeSourceRef {
+                        source_id: id.clone(),
+                        generation,
+                    },
+                    thread_id: self.session.clone(),
+                };
+                binding.key()?;
+                Ok(Some(binding))
+            }
+            _ => anyhow::bail!("native source and generation must be supplied together"),
+        }
+    }
+
+    fn link_key(&self) -> crate::Result<String> {
+        self.native_binding()?
+            .map(|binding| binding.key())
+            .unwrap_or_else(|| Ok(self.session.clone()))
+    }
+
+    fn validate_source(&self) -> crate::Result<()> {
+        if let Some(binding) = self.native_binding()? {
+            let registry = crate::rc::runtime_sources::Registry::open()?;
+            let context = crate::rc::runtime_context::RuntimeContext::resolve(
+                &registry,
+                &binding.source.source_id,
+            )?;
+            anyhow::ensure!(
+                context.source.generation == binding.source.generation,
+                "native source changed before landing"
+            );
+            let cwd = std::path::Path::new(&self.cwd).canonicalize()?;
+            let roots = crate::rc::policy::CanonicalRoots::from_verified(vec![cwd.clone()]);
+            let thread = context.locate(&binding.thread_id, &roots)?;
+            anyhow::ensure!(
+                thread.cwd == cwd,
+                "native thread directory differs from its landing"
+            );
+            crate::rc::local_goal::validate_header(&thread.transcript, &binding.thread_id, &cwd)?;
+        }
+        Ok(())
+    }
 }
 
 /// Builds the argv the daemon uses when it invokes `agit rc land` itself.
@@ -146,6 +205,7 @@ pub struct RevokeArgs {
 pub fn run(args: Args) -> CmdResult {
     crate::rc::select_local_authority();
     match args.action {
+        Action::Sources(a) => sources::run(a),
         Action::Tunnel => {
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -281,6 +341,7 @@ fn grants(args: GrantsArgs) -> CmdResult {
 ///
 /// Idempotent on purpose — the daemon calls it on every session start/resume.
 fn land(args: LandArgs) -> CmdResult {
+    args.validate_source()?;
     if args.local_owner {
         return land_local(args);
     }
@@ -331,7 +392,7 @@ fn land(args: LandArgs) -> CmdResult {
 
     let native = crate::domain::merge_archive::RuntimeLinkKey {
         runtime: runtime.into(),
-        session_id: args.session.clone(),
+        session_id: args.link_key()?,
     };
     let expected_archive = super::commit::archive::expected_rc_handoff()?;
     if let Some(expected) = &expected_archive {
@@ -416,7 +477,7 @@ fn land(args: LandArgs) -> CmdResult {
     }
     let store = crate::domain::store::Store::open_or_init()?;
     let _branch_guard = crate::domain::link::lock_branch(&store, &args.slug, &args.branch)?;
-    let _link_guard = crate::domain::link::lock(&store, &args.runtime, &args.session)?;
+    let _link_guard = crate::domain::link::lock(&store, &args.runtime, &args.link_key()?)?;
     let lk = landed_link(&store, &args, name)?;
 
     if repo.commit_count() == 0 {
@@ -442,7 +503,7 @@ fn land_local(args: LandArgs) -> CmdResult {
     )?;
     let store = crate::domain::store::Store::open_or_init()?;
     let _branch_guard = crate::domain::link::lock_branch(&store, &args.slug, &args.branch)?;
-    let _link_guard = crate::domain::link::lock(&store, &args.runtime, &args.session)?;
+    let _link_guard = crate::domain::link::lock(&store, &args.runtime, &args.link_key()?)?;
     let link = landed_link(&store, &args, lineage.name())?;
     anyhow::ensure!(
         link.merge_archive.is_none(),
@@ -508,8 +569,29 @@ fn landed_link(
     args: &LandArgs,
     agent: &str,
 ) -> crate::Result<crate::domain::link::Link> {
-    let mut lk = crate::domain::link::get(store, &args.runtime, &args.session)
-        .unwrap_or_else(|| crate::domain::link::Link::new(&args.runtime, &args.session, None));
+    args.validate_source()?;
+    let key = args.link_key()?;
+    let binding = args.native_binding()?;
+    let existing = if binding.is_some() {
+        crate::domain::link::read_archive_link_snapshot(store, &args.runtime, &key)?
+            .map(|snapshot| snapshot.link)
+    } else {
+        crate::domain::link::get(store, &args.runtime, &key)
+    };
+    let mut lk =
+        existing.unwrap_or_else(|| crate::domain::link::Link::new(&args.runtime, &key, None));
+    if let Some(previous) = &lk.native_binding {
+        anyhow::ensure!(
+            binding
+                .as_ref()
+                .is_some_and(
+                    |binding| binding.source.source_id == previous.source.source_id
+                        && binding.thread_id == previous.thread_id
+                ),
+            "native source identity changed during landing"
+        );
+    }
+    lk.native_binding = binding;
     anyhow::ensure!(
         lk.is_active(),
         "this runtime session was superseded; resume its active branch or import it onto a separate recovery line"
@@ -1001,6 +1083,30 @@ mod tests {
         assert_eq!(a.runtime, "claude-code");
         assert_eq!(a.session, "thread-1");
         assert_eq!(a.cwd, "/home/alice/code/payments");
+
+        let native = "00000000-0000-0000-0000-000000000001";
+        let source = crate::protocol::NativeSourceRef {
+            source_id: "src-00000000-0000-0000-0000-000000000002".into(),
+            generation: 3,
+        };
+        let full = super::land_argv(
+            "alice/payments",
+            AGENT_ID,
+            "work",
+            "codex",
+            native,
+            "/project",
+        );
+        let mut argv = vec!["x".to_string()];
+        argv.extend(full.into_iter().skip(1));
+        argv.extend(["--source-id".into(), source.source_id.clone()]);
+        assert!(Probe::try_parse_from(&argv).is_err());
+        argv.extend(["--source-generation".into(), source.generation.to_string()]);
+        let super::Action::Land(a) = Probe::try_parse_from(&argv).unwrap().cmd else {
+            panic!("expected landing")
+        };
+        assert_eq!(a.session, native);
+        assert_eq!(a.link_key().unwrap(), source.session_ref(native));
     }
 
     /// **Landing must not erase the materialization baseline.**
@@ -1081,6 +1187,8 @@ mod tests {
             branch: "work".into(),
             runtime: "claude-code".into(),
             session: "thread".into(),
+            source_id: None,
+            source_generation: None,
             cwd: "/home/alice/code/photo".into(),
         };
         let repeated = super::landed_link(&store, &args, "photo").unwrap();

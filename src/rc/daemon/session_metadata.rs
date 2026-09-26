@@ -23,7 +23,7 @@ impl Daemon {
         let caller = caller_scope(frame)?;
         require_role(&caller, frame.method())?;
         let session_id = queued_session_id(frame)?;
-        let driving = self.session_channel(&session_id, &caller, Need::Drive)?;
+        let driving = self.session_channel(&session_id, &caller, Need::Read)?;
         let live = &self.sessions[&session_id];
         let (ticket, receipt) = crate::rc::ticket::ticket_authorized(frame.authority.clone());
         let command = match frame.method() {

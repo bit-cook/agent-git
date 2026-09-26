@@ -90,6 +90,13 @@ impl Daemon {
                 }
             }
         }
+        if frame.method() == method::APPROVAL_RESOLVED
+            && let Ok(p) = frame.params_as::<crate::protocol::ApprovalResolved>()
+            && p.session_id == stream
+            && let Some(live) = self.sessions.get_mut(&stream)
+        {
+            live.approval_session_modes.remove(&p.approval_id);
+        }
         if frame.method() == method::TURN_COMPLETED
             && let Some(live) = self.sessions.get_mut(&stream)
         {
@@ -159,6 +166,17 @@ impl Daemon {
     /// nothing to revive by logical id after a restart.
     pub(super) fn on_session_note(&mut self, note: SessionNote) {
         match note {
+            SessionNote::NativeSettings {
+                session_id,
+                generation,
+                mode,
+                ack,
+            } => {
+                let result = self
+                    .observe_native_settings(&session_id, generation, mode)
+                    .map_err(|error| error.to_string());
+                let _ = ack.send(result);
+            }
             SessionNote::TerminalExited { terminal_id } => {
                 // Removing it triggers `Terminal`'s idempotent `Drop` cleanup;
                 // the dedicated reaper has already waited on a shell that
@@ -349,9 +367,10 @@ impl Daemon {
                     live.info.permission_mode = Some(crate::protocol::PermissionMode::Plan);
                     live.pending_mode = None;
                 }
-                self.roster.record(
+                if let Err(error) = self.roster.record(
                     &session_id,
                     roster::Entry {
+                        native_source: info.native_source.clone(),
                         runtime: info.runtime.clone(),
                         thread_id: runtime_thread_id,
                         cwd,
@@ -365,7 +384,10 @@ impl Daemon {
                         // `record` carries the prior row's old thread id over.
                         prior_threads: vec![],
                     },
-                );
+                ) {
+                    eprintln!("agitd: could not bind the session's native source: {error:#}");
+                    return;
+                }
                 // Only now is the current thread binding on the record, and the
                 // poison lifts with it — but **only once this save really
                 // reaches disk**.
@@ -427,6 +449,37 @@ impl Daemon {
             return Err(no_such_session(session_id));
         }
         require_same_workspace(caller, session_id, &live.info.workspace_id)?;
+        if let Some(source) = &live.info.native_source {
+            let context = crate::rc::runtime_sources::Registry::open()
+                .and_then(|registry| {
+                    crate::rc::runtime_context::RuntimeContext::resolve(
+                        &registry,
+                        &source.source_id,
+                    )
+                })
+                .map_err(source_sessions::unavailable)?;
+            if context.source.generation != source.generation {
+                return Err(source_sessions::unavailable(
+                    "runtime source changed; reconnect this conversation",
+                ));
+            }
+            let native = live
+                .runtime_thread_id
+                .as_deref()
+                .ok_or_else(|| source_sessions::unavailable("native binding is unavailable"))?;
+            let thread = context
+                .locate(native, &self.mirror.roots(&caller.workspace_id))
+                .map_err(source_sessions::unavailable)?;
+            if self
+                .roster
+                .get(session_id)
+                .is_some_and(|entry| std::path::Path::new(&entry.cwd) != thread.cwd)
+            {
+                return Err(source_sessions::unavailable(
+                    "native conversation directory changed",
+                ));
+            }
+        }
         if need == Need::Drive && !live.restart_guard_attempts.is_empty() {
             return Err(RpcError::new(
                 ErrorCode::SessionBusy,
@@ -465,7 +518,8 @@ impl Daemon {
             .find(|l| {
                 !l.ended
                     && l.info.workspace_id == caller.workspace_id
-                    && (l.runtime_thread_id.as_deref() == Some(needle)
+                    && ((l.info.native_source.is_none()
+                        && l.runtime_thread_id.as_deref() == Some(needle))
                         || l.info.session_id == needle)
             })
             .map(|l| l.info.clone())
@@ -475,7 +529,8 @@ impl Daemon {
         self.sessions.values().any(|live| {
             live.ended
                 && live.info.workspace_id == caller.workspace_id
-                && (live.runtime_thread_id.as_deref() == Some(needle)
+                && ((live.info.native_source.is_none()
+                    && live.runtime_thread_id.as_deref() == Some(needle))
                     || live.info.session_id == needle)
         })
     }
@@ -524,11 +579,13 @@ impl Daemon {
         info.last_seq = self.journal.last_seq(&info.session_id);
         if let Some(live) = self.sessions.get(&info.session_id) {
             info.runtime_session_id = live.runtime_thread_id.clone();
+            info.native_source = live.info.native_source.clone();
         } else if let Some(entry) = self.roster.get(&info.session_id)
             && entry.workspace_id == info.workspace_id
             && entry.runtime == info.runtime
         {
             info.runtime_session_id = Some(entry.thread_id.clone());
+            info.native_source = entry.native_source.clone();
         }
         info.runtime_session_id = info.runtime_session_id.filter(|id| !id.is_empty());
         info
@@ -705,6 +762,7 @@ mod bound_lineage_tests {
 
     fn claimed_row() -> roster::Entry {
         roster::Entry {
+            native_source: None,
             runtime: "claude-code".into(),
             thread_id: "native-1".into(),
             cwd: "/tmp".into(),
@@ -749,6 +807,7 @@ mod bound_lineage_tests {
                     let (cmd_tx, _cmd_rx) = mpsc::channel(1);
                     let info = SessionInfo {
                         session_id: "agit-S".into(),
+                        native_source: None,
                         runtime_session_id: None,
                         workspace_id: "ws1".into(),
                         project_id: Some("project-1".into()),

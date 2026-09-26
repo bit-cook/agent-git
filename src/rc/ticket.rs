@@ -44,6 +44,7 @@ const ABANDONED: u8 = 2;
 /// The executor's half of the receipt; it travels into the queue with the `Command`.
 pub struct Ticket<T> {
     authority: super::authority::Guard,
+    owner_control: bool,
     state: Arc<AtomicU8>,
     done: oneshot::Sender<crate::Result<T>>,
 }
@@ -75,6 +76,7 @@ pub(crate) fn ticket_authorized<T>(authority: super::authority::Guard) -> (Ticke
     (
         Ticket {
             authority,
+            owner_control: true,
             state: state.clone(),
             done: tx,
         },
@@ -83,6 +85,22 @@ pub(crate) fn ticket_authorized<T>(authority: super::authority::Guard) -> (Ticke
 }
 
 impl<T> Ticket<T> {
+    pub(crate) fn with_control_ceiling(mut self, owner: bool) -> Self {
+        self.owner_control = owner;
+        self
+    }
+
+    pub(crate) fn check_control(&self, requires_owner: bool) -> crate::Result<()> {
+        self.authority
+            .check()
+            .map_err(|error| anyhow::anyhow!(error.message))?;
+        anyhow::ensure!(
+            !requires_owner || self.owner_control,
+            "native permissions changed; this instruction requires workspace owner access"
+        );
+        Ok(())
+    }
+
     /// Called once on dequeue. `false` = the caller has already abandoned it, **do not
     /// execute**.
     pub fn accept(&self) -> bool {

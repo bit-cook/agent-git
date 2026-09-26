@@ -172,8 +172,11 @@ pub fn authorize(
         .unwrap_or(Access::Admin);
     let mut start_id = None;
     let selection = match method.as_str() {
-        "machine.describe" | "workspace.list" | "session.list" => (Target::Catalog, Need::Read),
-        "session.history"
+        "machine.describe" | "workspace.list" | "session.list" | "session.catalog.list" => {
+            (Target::Catalog, Need::Read)
+        }
+        "session.catalog.settings"
+        | "session.history"
         | "session.goal.read"
         | "session.subscribe"
         | "session.watch"
@@ -190,12 +193,77 @@ pub fn authorize(
         | "session.setModel"
         | "session.setPermissionMode" => {
             let id = params["session_id"].as_str().ok_or_else(denied)?.to_owned();
-            let session = resources.session(&id).cloned().ok_or_else(|| {
+            let resolved = if matches!(
+                method.as_str(),
+                "session.catalog.settings"
+                    | "session.goal.read"
+                    | "session.resume"
+                    | "session.watch"
+                    | "session.unwatch"
+                    | "session.history"
+                    | "session.enqueue"
+            ) {
+                resources.resolve_catalog(&id).map_err(|_| {
+                    RpcError::new(
+                        ErrorCode::SessionNotFound,
+                        "conversation source is unavailable; refresh the catalog",
+                    )
+                })?
+            } else {
+                resources.session(&id).cloned()
+            };
+            let session = resolved.ok_or_else(|| {
                 RpcError::new(
                     ErrorCode::SessionNotFound,
                     "refresh the executor session catalog before addressing this session",
                 )
             })?;
+            if let Some(source) = &session.source {
+                let managed_operation = session.id.starts_with("agit-")
+                    && matches!(
+                        method.as_str(),
+                        "session.history"
+                            | "session.subscribe"
+                            | "session.model"
+                            | "session.commands"
+                            | "session.enqueue"
+                            | "session.setModel"
+                            | "session.setPermissionMode"
+                            | "approval.decide"
+                            | "turn.interrupt"
+                    );
+                let watch_read =
+                    id == super::super::daemon::watch_stream_id(
+                        super::super::endpoint::WORKSPACE,
+                        &source.session_ref(&session.native_id),
+                    ) && method == "session.subscribe";
+                if !matches!(
+                    method.as_str(),
+                    "session.catalog.settings"
+                        | "session.goal.read"
+                        | "session.resume"
+                        | "session.watch"
+                        | "session.unwatch"
+                        | "session.history"
+                        | "session.enqueue"
+                ) && !managed_operation
+                    && !watch_read
+                {
+                    return Err(RpcError::new(
+                        ErrorCode::SessionNotFound,
+                        "this operation requires source-aware session attachment",
+                    ));
+                }
+                params["source_id"] = serde_json::json!(source.source_id);
+                params["source_generation"] = serde_json::json!(source.generation);
+                params["native_session_id"] = serde_json::json!(session.native_id);
+                params["expected_cwd"] = serde_json::json!(session.cwd);
+            } else if method == "session.catalog.settings" {
+                return Err(RpcError::new(
+                    ErrorCode::SessionNotFound,
+                    "refresh the source-qualified session catalog",
+                ));
+            }
             let need = if method == "session.command" {
                 Need::Admin
             } else if matches!(
@@ -207,6 +275,7 @@ pub fn authorize(
                     | "session.unwatch"
                     | "session.commands"
                     | "session.model"
+                    | "session.catalog.settings"
             ) {
                 Need::Read
             } else {

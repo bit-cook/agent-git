@@ -611,8 +611,29 @@ pub enum SessionStatus {
     Ended,
 }
 
+/// Source generation fences a captured connection; source ID identifies the native store.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NativeSourceRef {
+    pub source_id: String,
+    pub generation: u64,
+}
+
+impl NativeSourceRef {
+    pub fn session_ref(&self, native: &str) -> String {
+        use sha2::{Digest, Sha256};
+        let mut digest = Sha256::new();
+        digest.update(b"agit-native-session-v1\0");
+        digest.update(self.source_id.as_bytes());
+        digest.update([0]);
+        digest.update(native.as_bytes());
+        format!("local-{:x}", digest.finalize())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SessionInfo {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_source: Option<NativeSourceRef>,
     /// Logical session id (`agit-…`) = branch. Never the harness's thread id.
     pub session_id: String,
     /// Executor-owned native identity, absent until the harness reports it.
@@ -750,14 +771,18 @@ pub struct SessionSetPermissionModeResult {
     pub applied: PermissionApply,
 }
 
-/// `session.permissionMode` — broadcast after a successful change.
+/// `session.permissionMode` carries the latest permission observation.
 ///
 /// Sent to every viewer, not just the one who asked: two people watching one
 /// session must not disagree about how much it is allowed to do.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SessionPermissionMode {
     pub session_id: String,
-    pub mode: PermissionMode,
+    /// Null means the native policy cannot currently be confirmed.
+    pub mode: Option<PermissionMode>,
+    /// The native service has updated its defaults, including for other subscribers.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub native_default: bool,
     pub applied: PermissionApply,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub by: Option<String>,
@@ -1008,6 +1033,13 @@ pub enum ApprovalKind {
     Exec,
     FileChange,
     PermissionEscalation,
+}
+
+/// A request has closed; this does not identify which client's decision won.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ApprovalResolved {
+    pub session_id: String,
+    pub approval_id: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

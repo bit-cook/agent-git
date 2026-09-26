@@ -23,6 +23,11 @@ impl CodexDriver {
                 LaunchError::spawned(anyhow::anyhow!("Codex exited while opening its session"))
             })?;
             let value = match queued.line() {
+                Line::Fatal(message) => {
+                    return Err(LaunchError::spawned(anyhow::anyhow!(
+                        "Codex opening transport failed: {message}"
+                    )));
+                }
                 Line::Eof => {
                     return Err(LaunchError::spawned(anyhow::anyhow!(
                         "Codex exited before confirming {method}"
@@ -122,14 +127,56 @@ impl CodexDriver {
                 .get("reasoningEffort")
                 .and_then(Value::as_str)
                 .map(str::to_owned);
+            if let Some(mode) = crate::rc::native_settings::native_reply(result).permission_mode {
+                self.mode = mode;
+                self.native_mode_unknown = false;
+            } else if self.proc.shared() {
+                self.native_mode_unknown = true;
+            }
+            if self.proc.shared() {
+                self.current_turn = shared_active_turn(result).map_err(LaunchError::spawned)?;
+            }
             self.handshake_request = None;
             self.opening_ready = Some(HarnessEvent::Ready {
                 runtime_thread_id: native.to_owned(),
                 transcript_path: self.transcript_path(),
             });
+            self.control_acquired();
             return Ok(());
         }
     }
+}
+
+pub(super) fn shared_active_turn(result: &Value) -> crate::Result<Option<String>> {
+    let turns = result
+        .pointer("/initialTurnsPage/data")
+        .or_else(|| result.pointer("/thread/turns"))
+        .and_then(Value::as_array);
+    let mut active = None;
+    for turn in turns
+        .into_iter()
+        .flatten()
+        .filter(|turn| turn["status"] == "inProgress")
+    {
+        let id = turn["id"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("Codex resume omitted its active turn id"))?;
+        validate_native_turn_id(id).map_err(anyhow::Error::msg)?;
+        anyhow::ensure!(
+            active.is_none(),
+            "Codex resume reported multiple active turns"
+        );
+        active = Some(id.to_owned());
+    }
+    anyhow::ensure!(
+        result
+            .pointer("/thread/status/type")
+            .and_then(Value::as_str)
+            != Some("active")
+            || active.is_some(),
+        "Codex resume reported an active session without its current turn; reconnect with a Codex version supporting bounded turn metadata"
+    );
+    Ok(active)
 }
 
 #[cfg(all(test, unix))]
@@ -146,6 +193,22 @@ mod tests {
             .await
             .unwrap();
         driver
+    }
+
+    #[test]
+    fn bounded_resume_preserves_active_turn_and_rejects_missing_identity() {
+        let active = json!({"thread":{"status":{"type":"active"},"turns":[]},
+            "initialTurnsPage":{"data":[{"id":"active-turn","status":"inProgress","items":[]}]}});
+        assert_eq!(
+            shared_active_turn(&active).unwrap().as_deref(),
+            Some("active-turn")
+        );
+        let mut missing = active.clone();
+        missing["initialTurnsPage"]["data"] = json!([]);
+        assert!(shared_active_turn(&missing).is_err());
+        let idle = json!({"thread":{"status":{"type":"idle"},"turns":[]},
+            "initialTurnsPage":{"data":[{"id":"done","status":"completed","items":[]}]}});
+        assert_eq!(shared_active_turn(&idle).unwrap(), None);
     }
 
     #[tokio::test]
@@ -203,7 +266,7 @@ mod tests {
                     ("AGIT_PERSIST_RESULT".into(), reply.to_string()),
                 ],
             )
-            .unwrap();
+            .unwrap().into();
             driver.handshake_request = Some((1, "initialize"));
             driver.next_id = Some(2);
             driver
@@ -296,5 +359,181 @@ mod tests {
         assert!(failure.reached_spawn());
         assert!(!failure.is_external_writer());
         driver.shutdown().await.unwrap();
+    }
+    #[tokio::test]
+    async fn shared_resume_preserves_settings_and_filters_other_threads() {
+        for approval in ["never", "on-request"] {
+            shared_resume_with_policy(approval).await;
+        }
+    }
+
+    async fn shared_resume_with_policy(approval: &'static str) {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message;
+        let root = tempfile::tempdir().unwrap();
+        let socket = root.path().join("codex.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut connection = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let request: Value =
+                serde_json::from_str(connection.next().await.unwrap().unwrap().to_text().unwrap())
+                    .unwrap();
+            assert_eq!(request["method"], "initialize");
+            connection
+                .send(Message::Text(
+                    json!({"id":request["id"],"result":{}}).to_string().into(),
+                ))
+                .await
+                .unwrap();
+            let request: Value =
+                serde_json::from_str(connection.next().await.unwrap().unwrap().to_text().unwrap())
+                    .unwrap();
+            assert_eq!(request["method"], "thread/resume");
+            assert_eq!(
+                request["params"],
+                json!({"threadId":"native","excludeTurns":true,
+                "initialTurnsPage":{"limit":1,"itemsView":"notLoaded","sortDirection":"desc"}})
+            );
+            connection.send(Message::Text(json!({"id":request["id"],"result":{"thread":{"id":"native"},"model":"native-model","approvalPolicy":approval,"sandbox":{"type":"readOnly"}}}).to_string().into())).await.unwrap();
+            let request: Value =
+                serde_json::from_str(connection.next().await.unwrap().unwrap().to_text().unwrap())
+                    .unwrap();
+            assert_eq!(request["method"], "thread/settings/update");
+            assert_eq!(
+                request["params"],
+                json!({"threadId":"native","model":"native-model","effort":"high"})
+            );
+            connection
+                .send(Message::Text(
+                    json!({"id":request["id"],"result":{}}).to_string().into(),
+                ))
+                .await
+                .unwrap();
+            while let Some(frame) = connection.next().await {
+                if matches!(frame, Ok(Message::Close(_))) {
+                    break;
+                }
+            }
+        });
+        let source = crate::rc::native_codex::Source::new(
+            root.path(),
+            &std::env::current_exe().unwrap(),
+            Some(&socket),
+        )
+        .unwrap();
+        let mut driver = CodexDriver::launch_shared(
+            LaunchSpec {
+                cwd: root.path().to_path_buf(),
+                resume_from: Some("native".into()),
+                agit_session: None,
+                model: Some("must-not-override".into()),
+                dangerous: true,
+                permission_mode: Some(PermissionMode::Bypass),
+            },
+            &source,
+        )
+        .await
+        .unwrap();
+        driver.confirm_opening().await.unwrap();
+        driver.expire_test_fallback_control();
+        assert!(driver.background_after_silence(true).await.is_none());
+        assert_eq!(driver.control_snapshot()["mode"], "shared");
+        assert_eq!(driver.model.as_deref(), Some("native-model"));
+        assert_eq!(driver.permission_mode_known(), approval == "never");
+        if driver.permission_mode_known() {
+            assert_eq!(driver.permission_mode(), PermissionMode::Plan);
+        }
+        driver.model_catalog =
+            vec![json!({"id":"native-model","efforts":[{"id":"high"}],"default_effort":"high"})];
+        driver.current_turn = Some("active-turn".into());
+        let patched = driver
+            .model_control(Some(&crate::rc::harness::models::ModelPatch {
+                model: None,
+                effort: Some(Some("high".into())),
+            }))
+            .await
+            .unwrap();
+        assert_eq!(patched["model"], "native-model");
+        assert_eq!(patched["effort"], "high");
+        assert_eq!(patched["applied"], "next_turn");
+        assert!(driver.pending_model.is_none());
+        assert_eq!(driver.current_turn.take().as_deref(), Some("active-turn"));
+        for event in [
+            json!({"method":"thread/started","params":{"thread":{"id":"other"}}}),
+            json!({"method":"turn/started","params":{"threadId":"other","turn":{"id":"other-turn"}}}),
+            json!({"id":99,"method":"item/commandExecution/requestApproval","params":{"threadId":"other","turnId":"other-turn","itemId":"command"}}),
+        ] {
+            assert!(driver.classify(event).await.is_none());
+        }
+        assert_eq!(driver.thread_id.as_deref(), Some("native"));
+        assert!(driver.current_turn.is_none());
+        assert!(driver.pending_approvals.is_empty());
+        driver.shutdown().await.unwrap();
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires AGIT_NATIVE_CODEX_TEST_BINARY and starts an isolated native daemon"]
+    async fn native_shared_server_survives_driver_disconnect() {
+        let executable = PathBuf::from(
+            std::env::var_os("AGIT_NATIVE_CODEX_TEST_BINARY").expect("native binary"),
+        );
+        let root = tempfile::Builder::new()
+            .prefix("agit-native-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let home = root.path().join("runtime");
+        std::fs::create_dir(&home).unwrap();
+        struct Cleanup(u32);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                // This process group is created by this isolated test, never discovered.
+                unsafe {
+                    libc::kill(-(self.0 as i32), libc::SIGTERM);
+                }
+            }
+        }
+        let source = crate::rc::native_codex::Source::new(&home, &executable, None).unwrap();
+        let socket_directory = source.socket().parent().unwrap();
+        std::fs::create_dir(socket_directory).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(socket_directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+        drop(std::os::unix::net::UnixListener::bind(source.socket()).unwrap());
+        assert!(source.socket().exists());
+        let spec = LaunchSpec {
+            cwd: root.path().to_path_buf(),
+            resume_from: None,
+            agit_session: None,
+            model: None,
+            dangerous: false,
+            permission_mode: Some(PermissionMode::Plan),
+        };
+        let mut first = CodexDriver::launch_shared(spec.clone(), &source)
+            .await
+            .unwrap();
+        let Transport::Shared(client) = &first.proc else {
+            panic!("shared client required")
+        };
+        let _cleanup = Cleanup(client.started_pid().expect("isolated test owns its server"));
+        first.confirm_opening().await.unwrap();
+        let native = first.runtime_thread_id().unwrap().to_owned();
+        let mut resume = spec;
+        resume.resume_from = Some(native.clone());
+        let mut second = CodexDriver::launch_shared(resume, &source).await.unwrap();
+        second.confirm_opening().await.unwrap();
+        assert_eq!(second.runtime_thread_id(), Some(native.as_str()));
+        assert_eq!(second.permission_mode(), PermissionMode::Plan);
+        assert!(second.transcript_path().unwrap().starts_with(source.home()));
+        first.shutdown().await.unwrap();
+        let result = second
+            .command_request(
+                "thread/read",
+                json!({"threadId":native,"includeTurns":false}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["thread"]["id"], native);
+        second.shutdown().await.unwrap();
     }
 }

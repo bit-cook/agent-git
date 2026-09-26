@@ -487,6 +487,8 @@ fn is_read(method: &str) -> bool {
         "machine.describe"
             | "workspace.list"
             | "session.list"
+            | "session.catalog.list"
+            | "session.catalog.settings"
             | "session.history"
             | "session.goal.read"
             | "session.commands"

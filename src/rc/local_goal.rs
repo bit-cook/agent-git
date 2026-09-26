@@ -6,7 +6,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-fn validate_header(path: &Path, native: &str, cwd: &Path) -> crate::Result<()> {
+pub(crate) fn validate_header(path: &Path, native: &str, cwd: &Path) -> crate::Result<()> {
     let file = std::fs::File::open(path)?;
     let mut line = String::new();
     std::io::BufReader::new(file.take(1024 * 1024)).read_line(&mut line)?;
@@ -26,7 +26,34 @@ fn validate_header(path: &Path, native: &str, cwd: &Path) -> crate::Result<()> {
     Ok(())
 }
 
-fn target(params: Value) -> crate::Result<(String, PathBuf)> {
+struct Target {
+    native: String,
+    cwd: PathBuf,
+    context: Option<super::runtime_context::RuntimeContext>,
+    entry: Option<super::roster::Entry>,
+}
+
+impl Target {
+    fn validate(&self) -> crate::Result<()> {
+        let roots = super::mirror::Mirror::load().roots(super::endpoint::WORKSPACE);
+        super::policy::require_within(&self.cwd, &roots)?;
+        let path = if let Some(context) = &self.context {
+            let thread = context.locate(&self.native, &roots)?;
+            ensure!(
+                thread.cwd == self.cwd,
+                "Native conversation directory changed"
+            );
+            thread.transcript
+        } else {
+            crate::adapter::get("codex")?
+                .resolve(&self.native, Some(&self.cwd))
+                .context("Native transcript is unavailable")?
+        };
+        validate_header(&path, &self.native, &self.cwd)
+    }
+}
+
+fn target(params: Value) -> crate::Result<Target> {
     let session = params["session_id"]
         .as_str()
         .context("Session id is required")?;
@@ -34,11 +61,23 @@ fn target(params: Value) -> crate::Result<(String, PathBuf)> {
     let entry = roster.get(session);
     if let Some(entry) = entry {
         ensure!(
-            entry.workspace_id == super::local::WORKSPACE && entry.runtime == "codex",
+            entry.workspace_id == super::endpoint::WORKSPACE && entry.runtime == "codex",
             "Goal inspection requires a Codex session in the local workspace"
         );
     }
-    let native = entry.map(|e| e.thread_id.as_str()).unwrap_or(session);
+    let catalog = if entry.is_none() && session.starts_with("local-") {
+        Some(
+            super::runtime_catalog::Catalog::open()?
+                .lookup(session)?
+                .context("Conversation source is unavailable; refresh the catalog")?,
+        )
+    } else {
+        None
+    };
+    let native = entry
+        .map(|e| e.thread_id.as_str())
+        .or_else(|| catalog.as_ref().map(|row| row.native_session_id.as_str()))
+        .unwrap_or(session);
     ensure!(
         !native.is_empty()
             && native.len() <= 128
@@ -49,34 +88,135 @@ fn target(params: Value) -> crate::Result<(String, PathBuf)> {
     );
     let cwd = entry
         .map(|e| e.cwd.as_str())
+        .or_else(|| catalog.as_ref().and_then(|row| row.cwd.to_str()))
         .or_else(|| params["cwd"].as_str())
         .context("Working directory is required")?;
-    let roots = super::mirror::Mirror::load().roots(super::local::WORKSPACE);
+    let roots = super::mirror::Mirror::load().roots(super::endpoint::WORKSPACE);
     let cwd = super::policy::require_within(Path::new(cwd), &roots)?;
-    validate_source(native, &cwd)?;
-    Ok((native.to_string(), cwd))
-}
-
-fn validate_source(native: &str, cwd: &Path) -> crate::Result<()> {
-    let path = crate::adapter::get("codex")?
-        .resolve(native, Some(cwd))
-        .context("Native transcript is unavailable")?;
-    validate_header(&path, native, cwd)
+    let source = entry
+        .and_then(|entry| entry.native_source.clone())
+        .or_else(|| {
+            catalog
+                .as_ref()
+                .map(|row| crate::protocol::NativeSourceRef {
+                    source_id: row.source_id.clone(),
+                    generation: row.source_generation,
+                })
+        });
+    let context = source
+        .map(|source| {
+            let context = super::runtime_context::RuntimeContext::resolve(
+                &super::runtime_sources::Registry::open()?,
+                &source.source_id,
+            )?;
+            ensure!(
+                context.source.generation == source.generation,
+                "Runtime source changed"
+            );
+            Ok::<_, anyhow::Error>(context)
+        })
+        .transpose()?;
+    let target = Target {
+        native: native.into(),
+        cwd,
+        context,
+        entry: entry.cloned(),
+    };
+    target.validate()?;
+    Ok(target)
 }
 
 pub async fn read(params: Value) -> crate::Result<Value> {
-    let (native, cwd) = tokio::task::spawn_blocking(move || target(params)).await??;
-    let result = super::harness::models::codex_goal(cwd.clone(), &native).await?;
-    let roots = super::mirror::Mirror::load().roots(super::local::WORKSPACE);
-    super::policy::require_within(&cwd, &roots)?;
-    let redactor = super::protection::for_native("codex", &native, &cwd)?;
-    Ok(redactor.try_scrub_json(&result)?.value)
+    let target = tokio::task::spawn_blocking(move || target(params)).await??;
+    let result = if let Some(context) = &target.context {
+        super::harness::models::shared_codex_goal(&context.source.native()?, &target.native).await?
+    } else {
+        super::harness::models::codex_goal(target.cwd.clone(), &target.native).await?
+    };
+    tokio::task::spawn_blocking(move || {
+        target.validate()?;
+        let redactor = super::local_history::source_redactor(
+            "codex",
+            &target.native,
+            &target.cwd,
+            target.context,
+            target.entry.as_ref(),
+        )?;
+        Ok(redactor.try_scrub_json(&result)?.value)
+    })
+    .await?
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::io::Write;
+
+    #[test]
+    fn source_goals_pin_home_and_revalidate_scope_before_returning() {
+        let root = tempfile::tempdir().unwrap();
+        crate::rc::with_agit_home(root.path(), || {
+            let project = root.path().join("project");
+            std::fs::create_dir(&project).unwrap();
+            let project = project.canonicalize().unwrap();
+            let mut mirror = super::super::mirror::Mirror::default();
+            mirror
+                .bind(super::super::endpoint::WORKSPACE, "project", &project)
+                .unwrap();
+            mirror.save().unwrap();
+            let registry = super::super::runtime_sources::Registry::open().unwrap();
+            let native = uuid::Uuid::new_v4().to_string();
+            let mut sources = Vec::new();
+            for name in ["alpha", "beta"] {
+                let home = root.path().join(name);
+                std::fs::create_dir(&home).unwrap();
+                let path = home.join("history.jsonl");
+                std::fs::write(
+                    &path,
+                    format!(
+                        "{}\n",
+                        serde_json::json!({
+                            "type":"session_meta", "payload":{"id":native,"cwd":project}
+                        })
+                    ),
+                )
+                .unwrap();
+                let db = rusqlite::Connection::open(home.join("state_1.sqlite")).unwrap();
+                db.execute_batch("CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT, cwd TEXT, first_user_message TEXT, thread_source TEXT, updated_at_ms INTEGER, archived INTEGER)").unwrap();
+                db.execute(
+                    "INSERT INTO threads VALUES (?1,?2,?3,'Preview','cli',1,0)",
+                    rusqlite::params![native, path.to_str(), project.to_str()],
+                )
+                .unwrap();
+                sources.push(registry.register(&home, None, None, None).unwrap());
+            }
+            let catalog = super::super::runtime_catalog::Catalog::open().unwrap();
+            let roots = mirror.roots(super::super::endpoint::WORKSPACE);
+            for _ in &sources {
+                catalog.reconcile(&roots).unwrap();
+            }
+            let read_target = |source: &super::super::runtime_sources::RuntimeSource| {
+                target(serde_json::json!({"session_id":source.session_ref(&native),
+                    "cwd":"/forged", "source_id":"forged", "native_session_id":"forged"}))
+            };
+            let first = read_target(&sources[0]).unwrap();
+            let second = read_target(&sources[1]).unwrap();
+            assert_eq!(first.native, native);
+            assert_eq!(first.cwd, project);
+            assert_eq!(first.context.as_ref().unwrap().source.home, sources[0].home);
+            assert_eq!(
+                second.context.as_ref().unwrap().source.home,
+                sources[1].home
+            );
+            registry.remove(&sources[0].source_id).unwrap();
+            assert!(first.validate().is_err());
+            assert!(read_target(&sources[0]).is_err());
+            second.validate().unwrap();
+            mirror.unbind(super::super::endpoint::WORKSPACE, "project");
+            mirror.save().unwrap();
+            assert!(second.validate().is_err());
+        });
+    }
 
     #[test]
     fn transcript_identity_and_directory_must_both_match() {

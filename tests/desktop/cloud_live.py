@@ -7,7 +7,7 @@ import argparse
 import asyncio
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import shlex
 import signal
 import subprocess
@@ -74,7 +74,13 @@ async def run(args, login):
     environment = dict(os.environ, AGIT_HOME=str(root / "agit"), AGIT_HUB_URL=args.hub, SHELL="/bin/bash")
     for name in ("AGIT_SESSION", "AGIT_MERGE_TX", "AGIT_RC"):
         environment.pop(name, None)
-    target_env = dict(AGIT_HOME=remote_root + "/agit", AGIT_HUB_URL=args.hub, SHELL="/bin/bash")
+    native_home = args.remote_codex_home or remote_root + "/codex"
+    fixture_path = PurePosixPath(remote_root)
+    native_path = PurePosixPath(native_home)
+    assert fixture_path.is_absolute() and ".." not in fixture_path.parts, "remote fixture root must be an absolute path"
+    assert native_path.is_relative_to(fixture_path) and ".." not in native_path.parts, "native home must stay inside the remote fixture"
+    target_env = dict(AGIT_HOME=remote_root + "/agit", CODEX_HOME=native_home,
+                      AGIT_HUB_URL=args.hub, SHELL="/bin/bash")
     response = await asyncio.to_thread(api, args.hub, "/api/auth/login", data=login)
     login.clear()
     token = response["access_token"]
@@ -87,8 +93,16 @@ async def run(args, login):
     print("Live cloud evidence:", root, flush=True)
     try:
         await remote(args, {}, "mkdir", "-p", remote_root + "/project")
+        if args.runtime == "codex":
+            await remote(args, {}, "python3", "-c",
+                "from pathlib import Path; import sys; root=Path(sys.argv[1]).resolve(strict=True); "
+                "home=Path(sys.argv[2]).resolve(strict=True); "
+                "assert home.is_dir() and home != root and home.is_relative_to(root), "
+                "'native fixture home must stay inside the canonical remote root'",
+                remote_root, native_home)
+            await remote(args, {}, "test", "-f", native_home + "/config.toml")
         # A live test must never attach to or replace an existing daemon namespace.
-        await remote(args, {}, "test", "!", "-e", remote_root + "/agit/desktop-rc/control.rpc")
+        await remote(args, {}, "test", "!", "-e", remote_root + "/agit")
         await remote(args, target_env, args.remote_binary, "login", "--hub", args.hub, "--with-token", input=token.encode())
         target_login = True
         await remote(args, target_env, args.remote_binary, "rc", "start", "--detach")
@@ -107,16 +121,34 @@ async def run(args, login):
             return (root / "agit/desktop-rc/control.rpc").exists()
         await eventually(source_ready, "local controller did not become ready")
         controller = await Client().connect(args.binary, environment, journal)
+        source = await controller.rpc("machine.describe")
+        source_fingerprint = source["machine"]["machine_fingerprint"]
         target_device = None
         async def online():
             nonlocal target_device
-            page = await controller.rpc("peer.cloud", operation="devices", hub=args.hub)
-            if not page["devices"]:
-                return False
-            target_device = page["devices"][0]["device"]
-            return page["devices"][0]["online"]
-        await eventually(online, "remote outbound presence did not reach dev", timeout=60)
+            cursor, seen = None, set()
+            while True:
+                params = dict(operation="devices", hub=args.hub)
+                if cursor is not None:
+                    params["after"] = cursor
+                page = await controller.rpc("peer.cloud", **params)
+                for row in page["devices"]:
+                    if row["device"]["machine_id"] == source_fingerprint and row["device"]["id"] not in devices:
+                        devices.append(row["device"]["id"])
+                matches = [row for row in page["devices"]
+                           if row["device"]["machine_id"] == target["machine"]["machine_fingerprint"]]
+                assert len(matches) <= 1, "fixture machine has ambiguous device enrollment"
+                if matches:
+                    target_device = matches[0]["device"]
+                    return matches[0]["online"]
+                cursor = page.get("next_cursor")
+                if cursor is None:
+                    return False
+                assert cursor not in seen, "cloud device pagination did not advance"
+                seen.add(cursor)
+        await eventually(online, "remote outbound presence did not reach the cloud", timeout=60)
         assert target_device is not None
+        devices.append(target_device["id"])
         config = dict(peer_id="target", hub=args.hub, target=target_device)
         connected = await controller.rpc("peer.connect_cloud", **config)
         assert connected["description"]["instance_id"] == target["instance_id"]
@@ -130,11 +162,11 @@ async def run(args, login):
         session = opened["session"]["session_id"]
         assert await controller.peer("session.start", **start) == opened
         await controller.peer("session.subscribe", session_id=session, after_seq=0)
-        marker = "CLOUD_LIVE_" + uuid.uuid4().hex
+        marker = "Cloud live " + uuid.uuid4().hex[:8]
         message = dict(session_id=session, client_msg_id=str(uuid.uuid4()),
                        message=f"Reply with exactly {marker}. Do not use tools or edit any files.")
-        receipt = await controller.peer("turn.start", **message)
-        assert await controller.peer("turn.start", **message) == receipt
+        receipt = await controller.peer("session.enqueue", **message)
+        assert await controller.peer("session.enqueue", **message) == receipt
         async def answered():
             complete = controller.events(session, "turn.completed")
             if not complete:
@@ -145,7 +177,7 @@ async def run(args, login):
             matched = any(event.get("kind") == "assistant_reply" and marker in (event.get("text") or "") for event in replies)
             return history if complete and matched else None
         await eventually(answered, "real harness reply did not reach cloud history", timeout=300)
-        print("PASS: dev relay delivered a real harness turn, duplicate receipt, events and history", flush=True)
+        print("PASS: cloud relay delivered a real harness turn, duplicate receipt, events and history", flush=True)
         first = (await controller.rpc("peer.list"))["peers"][0]
         os.kill(first["worker_pid"], signal.SIGKILL)
         async def recovered():
@@ -154,7 +186,7 @@ async def run(args, login):
         restored = await eventually(recovered, "cloud worker did not reconnect", timeout=60)
         assert restored["worker_pid"] != first["worker_pid"]
         assert restored["description"]["instance_id"] == target["instance_id"]
-        stale = await controller.raw("peer.request", peer_id="target", **controller.route, method="turn.start", params=message)
+        stale = await controller.raw("peer.request", peer_id="target", **controller.route, method="session.enqueue", params=message)
         assert stale["error"]["data"]["outcome"] == "not_sent", stale
         await controller.rpc("peer.connect_cloud", **config)
         await controller.peer("session.list", include_local=False)
@@ -163,9 +195,9 @@ async def run(args, login):
         async def replayed():
             return len(controller.events(session, "turn.completed")) > before
         await eventually(replayed, "remote session replay was lost")
-        assert await controller.peer("turn.start", **message) == receipt
+        assert await controller.peer("session.enqueue", **message) == receipt
         before = len(controller.events(session, "turn.completed"))
-        await controller.peer("turn.start", session_id=session, client_msg_id=str(uuid.uuid4()),
+        await controller.peer("session.enqueue", session_id=session, client_msg_id=str(uuid.uuid4()),
                               message="Repeat the exact marker from your previous reply and append _RECONNECTED. Do not use tools or edit files.")
         async def continued():
             complete = controller.events(session, "turn.completed")
@@ -232,6 +264,7 @@ if __name__ == "__main__":
     parser.add_argument("--binary", required=True)
     parser.add_argument("--remote-binary", required=True)
     parser.add_argument("--remote-root", required=True)
+    parser.add_argument("--remote-codex-home", help="Configured native home inside the remote fixture root; defaults to ROOT/codex")
     parser.add_argument("--host", required=True)
     parser.add_argument("--hub", required=True)
     parser.add_argument("--runtime", default="codex")

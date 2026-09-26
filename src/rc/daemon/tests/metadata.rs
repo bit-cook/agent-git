@@ -92,3 +92,31 @@ async fn metadata_does_not_block_input_or_release_its_writer_guard() {
         assert!(turn_worker.await.unwrap().response.is_ok());
     }
 }
+
+#[tokio::test]
+async fn viewers_read_metadata_while_writer_control_is_guarded() {
+    let (tx, _rx) = mpsc::channel(2);
+    let mut live = rpc_test_live("session-a", 1, tx, crate::protocol::PermissionMode::Bypass);
+    live.info.dangerous = true;
+    live.restart_guard_attempts.insert("pending-restart".into());
+    let daemon = rpc_test_daemon(
+        [("session-a".into(), live)].into_iter().collect(),
+        Roster::default(),
+    );
+    let mut state = daemon.lock().await;
+    for method_name in [method::SESSION_COMMANDS, method::SESSION_MODEL] {
+        let mut frame = Frame::request(method_name, serde_json::json!({"session_id":"session-a"}));
+        frame.caller = Some(claim("viewer", "ws-a"));
+        state.prepare_session_metadata(&frame).unwrap();
+        frame.caller = Some(claim("viewer", "another-workspace"));
+        assert!(state.prepare_session_metadata(&frame).is_err());
+    }
+    let mut turn = rpc_turn_frame("session-a");
+    turn.caller = Some(claim("viewer", "ws-a"));
+    assert!(state.prepare_session_rpc(&turn).is_err());
+    assert!(
+        state
+            .session_channel("session-a", &claim("operator", "ws-a"), Need::Drive)
+            .is_err()
+    );
+}

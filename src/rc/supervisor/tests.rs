@@ -1,5 +1,50 @@
 use super::*;
 
+#[tokio::test]
+async fn shared_approval_resolution_preserves_other_pending_requests() {
+    let driver = AnyDriver::Codex(Box::new(
+        crate::rc::harness::codex::CodexDriver::test_responder(Some("thread"), &[]),
+    ));
+    let (mut session, mut out, _notes) =
+        harness_test_session_with_channels(driver, "codex", SessionStatus::AwaitingApproval);
+    for id in ["first", "second"] {
+        session.pending.insert(
+            id.into(),
+            PendingApproval {
+                tool: "shell".into(),
+                input: serde_json::json!({}),
+                suggested_permission_mode: None,
+            },
+        );
+    }
+    session
+        .on_harness_event(HarnessEvent::ApprovalResolved {
+            approval_id: "first".into(),
+        })
+        .await;
+    assert_eq!(session.info.status, SessionStatus::AwaitingApproval);
+    assert!(session.pending.contains_key("second"));
+    let event = out.try_recv().unwrap();
+    assert_eq!(event.method(), method::APPROVAL_RESOLVED);
+    assert_eq!(event.params.unwrap()["approval_id"], "first");
+    session
+        .on_harness_event(HarnessEvent::ApprovalResolved {
+            approval_id: "first".into(),
+        })
+        .await;
+    assert!(out.try_recv().is_err());
+    session
+        .on_harness_event(HarnessEvent::ApprovalResolved {
+            approval_id: "second".into(),
+        })
+        .await;
+    assert_eq!(session.info.status, SessionStatus::Running);
+    assert!(session.pending.is_empty());
+    assert_eq!(out.try_recv().unwrap().method(), method::APPROVAL_RESOLVED);
+    assert_eq!(out.try_recv().unwrap().method(), method::SESSION_STATUS);
+    session.driver.shutdown().await.unwrap();
+}
+
 #[test]
 fn oversized_native_compactions_keep_summary_evidence_and_page_identity() {
     let native = serde_json::json!({"type":"compacted","ordinal":42,"uuid":"native-row","payload":{"message":"Compaction summary","replacement_history":"x".repeat(RAW_LINE_CAP)}});
@@ -30,6 +75,7 @@ pub(super) fn harness_test_session_with_channels(
     let session = Session {
         info: SessionInfo {
             session_id: "session-turn-test".into(),
+            native_source: None,
             runtime_session_id: None,
             workspace_id: "workspace-test".into(),
             project_id: None,
@@ -46,6 +92,8 @@ pub(super) fn harness_test_session_with_channels(
             updated_at: "now".into(),
         },
         driver,
+        background_poll_at: tokio::time::Instant::now(),
+        transcript_readable: false,
         tailer: None,
         native_records: native_records::NativeRecords::default(),
         redactor: redact::Redactor::this_machine(),

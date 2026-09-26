@@ -145,6 +145,7 @@ pub struct Redactor {
 
 #[cfg(feature = "rc")]
 struct NativeProtection {
+    source: Option<crate::protocol::NativeSourceRef>,
     runtime: String,
     session: String,
     evidence: crate::domain::secrets::identity::Evidence,
@@ -309,6 +310,7 @@ impl Redactor {
         root: &std::path::Path,
     ) -> Self {
         self.native = Some(Arc::new(std::sync::Mutex::new(NativeProtection {
+            source: None,
             runtime: runtime.into(),
             session: session.into(),
             evidence: crate::domain::secrets::identity::Evidence::new(
@@ -317,6 +319,21 @@ impl Redactor {
             ),
             seeded: false,
         })));
+        self
+    }
+
+    #[cfg(feature = "rc")]
+    pub(crate) fn with_native_source(
+        self,
+        source: Option<crate::protocol::NativeSourceRef>,
+    ) -> Self {
+        if let Some(native) = &self.native
+            && let Ok(mut native) = native.lock()
+        {
+            native.source = source;
+            native.evidence.reset();
+            native.seeded = false;
+        }
         self
     }
 
@@ -376,7 +393,12 @@ impl Redactor {
             let runtime = native.runtime.clone();
             let session = native.session.clone();
             if !native.seeded && !session.is_empty() {
-                native.evidence.seed_native(&runtime, &session)?;
+                let instance = native
+                    .source
+                    .as_ref()
+                    .map(|source| source.session_ref(&session))
+                    .unwrap_or_else(|| session.clone());
+                native.evidence.seed_native(&runtime, &instance)?;
                 native.seeded = true;
             }
             let masks: Vec<_> = records

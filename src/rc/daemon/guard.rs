@@ -85,6 +85,27 @@ impl Daemon {
             })
     }
 
+    pub(super) fn observe_native_settings(
+        &mut self,
+        session_id: &str,
+        generation: u64,
+        mode: Option<crate::protocol::PermissionMode>,
+    ) -> crate::Result<()> {
+        let live = self
+            .sessions
+            .get_mut(session_id)
+            .filter(|live| live.generation == generation && !live.ended)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "session generation disappeared before native settings were observed"
+                )
+            })?;
+        live.info.permission_mode = mode;
+        live.info.dangerous |= mode.is_none_or(|mode| mode.is_dangerous());
+        live.pending_mode = None;
+        self.persist_session_state_fail_closed(session_id)
+    }
+
     pub(super) fn observe_turn_guard(
         &mut self,
         session_id: &str,

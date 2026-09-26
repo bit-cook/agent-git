@@ -1,12 +1,27 @@
 use super::*;
 use anyhow::{Context, ensure};
 
+#[derive(Debug)]
+pub(super) struct NativeCommandRefusal(pub String);
+
+impl std::fmt::Display for NativeCommandRefusal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+impl std::error::Error for NativeCommandRefusal {}
+
 impl CodexDriver {
     pub async fn runtime_command(&mut self, name: &str, arguments: Value) -> crate::Result<Value> {
         ensure!(
             self.thread_id.is_some() && self.handshake_request.is_none(),
             "The Codex thread is still opening; no command was sent"
         );
+        if name == "foreground" {
+            return Ok(
+                json!({"control":self.control_snapshot(),"text":"Remote control is connected to this conversation."}),
+            );
+        }
         if name == "commands" {
             let mut catalog = json!({"commands": [
                 {"name":"personality","description":"Choose how Codex responds","argument_hint":"[none | friendly | pragmatic]"},
@@ -20,6 +35,7 @@ impl CodexDriver {
                 {"name":"approve","description":"Approve one retry of a recent auto-review denial"},
                 {"name":"feedback","description":"Send feedback to OpenAI with optional logs"},
                 {"name":"status","description":"Show this conversation and its runtime status"},
+                {"name":"foreground","description":"Reconnect remote control without sending a message"},
                 {"name":"memories","description":"Choose native memory mode for this conversation","argument_hint":"[enabled | disabled]"},
                 {"name":"mcp","description":"Show connected MCP servers and tools"},
                 {"name":"skills","description":"Show skills available in this project"},
@@ -46,7 +62,9 @@ impl CodexDriver {
                 }
                 Err(_) => catalog["skillsUnavailable"] = json!(true),
             }
-            if let Ok(prompts) = super::prompts::catalog() {
+            if let Ok(prompts) =
+                super::prompts::catalog(self.source.as_ref().map(|source| source.home()))
+            {
                 catalog["commands"].as_array_mut().unwrap().extend(prompts);
             }
             return Ok(catalog);
@@ -56,7 +74,7 @@ impl CodexDriver {
                 .as_str()
                 .context("Custom prompt name is required")?;
             return Ok(
-                json!({"prompt":super::prompts::expand(name, arguments["value"].as_str().unwrap_or_default())?}),
+                json!({"prompt":super::prompts::expand(self.source.as_ref().map(|source| source.home()), name, arguments["value"].as_str().unwrap_or_default())?}),
             );
         }
         if name == "skill.expand" {
@@ -314,12 +332,13 @@ impl CodexDriver {
             {
                 self.command_requests.remove(&id);
                 if let Some(error) = value.get("error") {
-                    anyhow::bail!(
-                        "{}",
+                    return Err(NativeCommandRefusal(
                         error["message"]
                             .as_str()
                             .unwrap_or("Codex refused the command")
-                    );
+                            .to_owned(),
+                    )
+                    .into());
                 }
                 return value
                     .get("result")
@@ -407,6 +426,50 @@ fn enabled_skills(value: &Value) -> impl Iterator<Item = &Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn custom_prompts_use_the_controlled_source_for_catalog_and_expansion() {
+        let root = tempfile::tempdir().unwrap();
+        for name in ["first-profile", "second-profile"] {
+            let home = root.path().join(name);
+            std::fs::create_dir_all(home.join("prompts")).unwrap();
+            std::fs::write(
+                home.join("prompts/task.md"),
+                format!("---\ndescription: {name}\n---\n{name} $ARGUMENTS"),
+            )
+            .unwrap();
+            let mut driver = CodexDriver::test_responder(
+                Some("thread"),
+                &[json!({"id":1,"result":{"data":[]}})],
+            );
+            driver.source = Some(
+                crate::rc::native_codex::Source::new(&home, std::path::Path::new("/bin/cat"), None)
+                    .unwrap(),
+            );
+            let catalog = driver.runtime_command("commands", json!({})).await.unwrap();
+            let prompt = catalog["commands"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|command| command["name"] == "prompts:task")
+                .unwrap();
+            assert_eq!(prompt["description"], name);
+            let expanded = driver
+                .runtime_command("prompt.expand", json!({"name":"task","value":"continue"}))
+                .await
+                .unwrap();
+            assert_eq!(expanded["prompt"], format!("{name} continue"));
+            std::fs::remove_file(home.join("prompts/task.md")).unwrap();
+            assert!(
+                driver
+                    .runtime_command("prompt.expand", json!({"name":"task"}))
+                    .await
+                    .is_err()
+            );
+            driver.shutdown().await.unwrap();
+        }
+    }
 
     #[cfg(unix)]
     #[tokio::test]

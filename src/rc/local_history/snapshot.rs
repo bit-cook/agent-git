@@ -226,9 +226,7 @@ impl Cache {
 static SNAPSHOTS: OnceLock<Cache> = OnceLock::new();
 
 pub(super) fn read(
-    runtime: &str,
-    native: &str,
-    cwd: &str,
+    target: &Target<'_>,
     params: &Value,
     timings: &mut Timings,
 ) -> crate::Result<Value> {
@@ -240,10 +238,20 @@ pub(super) fn read(
         .get("snapshot")
         .map(|value| value.as_str().context(Failure::InvalidCursor))
         .transpose()?;
-    let scope = json!([runtime, native, cwd]).to_string();
+    let Target {
+        runtime,
+        native,
+        cwd,
+        ..
+    } = target;
+    let source = target
+        .context
+        .as_ref()
+        .map(|context| (&context.source.source_id, context.source.generation));
+    let scope = json!([runtime, native, cwd, source]).to_string();
     let cache = SNAPSHOTS.get_or_init(Default::default);
     let (token, snapshot) = timings.measure("snapshot_ms", || {
-        cache.snapshot(scope, token, || capture(runtime, native, cwd, cache))
+        cache.snapshot(scope, token, || capture(target, cache))
     })?;
     // Only readers of the same immutable snapshot share file cursor positions.
     let mut entry = timings
@@ -258,9 +266,7 @@ pub(super) fn read(
         ensure!(end <= items.len() as u64, Failure::InvalidCursor);
         let start = end.saturating_sub(64);
         {
-            let redactor = timings.measure("protection_context_ms", || {
-                crate::rc::protection::for_native(runtime, native, std::path::Path::new(cwd))
-            })?;
+            let redactor = timings.measure("protection_context_ms", || target.redactor())?;
             let page: Vec<Value> = timings.measure("projection_ms", || {
                 items[start as usize..end as usize]
                     .iter()
@@ -286,9 +292,7 @@ pub(super) fn read(
             let context = select_view(&mut lines, runtime, params);
             Ok((lines, next, mode, context))
         })?;
-        let redactor = timings.measure("protection_context_ms", || {
-            crate::rc::protection::for_native(runtime, native, std::path::Path::new(cwd))
-        })?;
+        let redactor = timings.measure("protection_context_ms", || target.redactor())?;
         let items: Vec<Value> = timings.measure("projection_ms", || {
             let (items, _) = super::super::supervisor::items_from_lines_with_mode(
                 runtime, &redactor, &lines, mode,
@@ -296,7 +300,7 @@ pub(super) fn read(
             items
                 .into_iter()
                 .map(|mut item| {
-                    if runtime == "codex" && params["view"] == "conversation" {
+                    if *runtime == "codex" && params["view"] == "conversation" {
                         project_context(&mut item, &context);
                     }
                     item.event.line = None;
@@ -323,7 +327,13 @@ pub(super) fn read(
     Ok(result)
 }
 
-fn capture(runtime: &str, native: &str, cwd: &str, cache: &Cache) -> crate::Result<Snapshot> {
+fn capture(target: &Target<'_>, cache: &Cache) -> crate::Result<Snapshot> {
+    let Target {
+        runtime,
+        native,
+        cwd,
+        ..
+    } = target;
     let mut snapshot = Snapshot {
         _budget: cache.reserve(0)?,
         _file_budget: None,
@@ -331,7 +341,7 @@ fn capture(runtime: &str, native: &str, cwd: &str, cache: &Cache) -> crate::Resu
         native_items: None,
         bytes: 0,
     };
-    if runtime == "opencode" {
+    if *runtime == "opencode" {
         snapshot._budget.merge(cache.reserve(MAX_BYTES as u32)?);
         use crate::adapter::{Adapter, native_snapshot::Limits, opencode::OpenCode};
         let source = OpenCode.lookup_native_readonly(native, Limits::default())?;
@@ -340,8 +350,7 @@ fn capture(runtime: &str, native: &str, cwd: &str, cache: &Cache) -> crate::Resu
             std::path::Path::new(cwd),
         )?;
         snapshot.bytes = bytes.len() as u64;
-        let redactor =
-            crate::rc::protection::for_native(runtime, native, std::path::Path::new(cwd))?;
+        let redactor = target.redactor()?;
         let (items, _) = super::super::supervisor::native_records::NativeRecords::default()
             .project(&bytes, false, &redactor)?;
         let items = items
@@ -357,10 +366,16 @@ fn capture(runtime: &str, native: &str, cwd: &str, cache: &Cache) -> crate::Resu
         );
         snapshot.native_items = Some(items);
     } else {
-        let path = crate::adapter::get(runtime)?
-            .resolve(native, Some(std::path::Path::new(cwd)))
-            .ok_or(Failure::Missing)?;
-        let parts = if runtime == "codex" {
+        let path = if target.context.is_some() {
+            target.source_path(native)?
+        } else {
+            crate::adapter::get(runtime)?
+                .resolve(native, Some(std::path::Path::new(cwd)))
+                .ok_or(Failure::Missing)?
+        };
+        let parts = if target.context.is_some() {
+            lineage_from(&path, |id| target.parent_path(id))?
+        } else if *runtime == "codex" {
             lineage(&path)?
         } else {
             let file = std::fs::File::open(&path)?;

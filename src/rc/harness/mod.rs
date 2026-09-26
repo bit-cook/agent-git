@@ -294,6 +294,15 @@ pub enum HarnessEvent {
         effective_mode: Option<PermissionMode>,
     },
     Approval(ApprovalRequest),
+    /// The native request is no longer answerable, including through another client.
+    ApprovalResolved {
+        approval_id: String,
+    },
+    /// Native defaults changed, potentially through another shared client.
+    SettingsUpdated {
+        mode: Option<PermissionMode>,
+        applied: PermissionApply,
+    },
     GoalUpdated {
         goal: Value,
     },
@@ -370,6 +379,8 @@ pub enum TurnStartOutcome {
     /// The supervisor terminates the generation; a durable staged guard may be
     /// released because the sticky operation is proven not to have run.
     FatalNotAccepted { message: String },
+    /// Shared acceptance is uncertain; keep observing without resending the prompt.
+    SharedUnknown { message: String },
     Unknown {
         message: String,
         /// The sticky mode included in the request whose acceptance is now
@@ -411,6 +422,10 @@ pub enum TurnStartDispatch {
 /// flatten that ambiguity into an ordinary expired-card error.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ApprovalOutcome {
+    /// The shared native request closed; the protocol does not report the winning client.
+    Resolved,
+    /// Retain the card and observe the shared service without resending the decision.
+    AwaitingResolution { message: String },
     Applied {
         /// Exact effective session mode carried by the machine-originated
         /// suggestion, or `None` for a one-shot/native-only decision.
@@ -484,6 +499,12 @@ pub type PermissionModeChangeResult = Result<PermissionApply, PermissionModeChan
 /// has been proven terminated.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PermissionModeOutcome {
+    SharedApplied {
+        applied: PermissionApply,
+    },
+    SharedUnknown {
+        message: String,
+    },
     Applied {
         applied: PermissionApply,
     },
@@ -562,6 +583,10 @@ impl AnyDriver {
         matches!(self, AnyDriver::Codex(_))
     }
 
+    pub(crate) fn has_active_turn(&self) -> bool {
+        matches!(self, Self::Codex(driver) if driver.has_active_turn())
+    }
+
     pub fn runtime_thread_id(&self) -> Option<String> {
         match self {
             AnyDriver::ClaudeCode(d) => d.runtime_thread_id().map(String::from),
@@ -608,6 +633,16 @@ impl AnyDriver {
                 d.start_turn(message, consume_pending_mode, guard_attempt)
                     .await
             }
+        }
+    }
+
+    pub async fn enqueue(
+        &mut self,
+        request: crate::rc::native_queue::Request,
+    ) -> crate::Result<Value> {
+        match self {
+            AnyDriver::Codex(driver) => driver.enqueue(request).await,
+            _ => anyhow::bail!("this runtime does not offer a shared native queue"),
         }
     }
 
@@ -671,6 +706,14 @@ impl AnyDriver {
             AnyDriver::Codex(d) => d.permission_mode(),
             AnyDriver::OpenCode(d) => d.permission_mode(),
         }
+    }
+
+    pub fn shared_executor(&self) -> bool {
+        matches!(self, Self::Codex(driver) if driver.shared_executor())
+    }
+
+    pub fn permission_mode_known(&self) -> bool {
+        !matches!(self, Self::Codex(driver) if !driver.permission_mode_known())
     }
 
     pub async fn next_event(&mut self) -> Option<HarnessEvent> {

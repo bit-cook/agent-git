@@ -128,8 +128,12 @@ pub(crate) fn lookup_files_without_database(
 /// point at a replacement rollout while existing children still reference the original physical
 /// carrier. Archived rollouts retain their filename and remain valid history bases.
 pub(crate) fn lookup_codex_rollout(id: &str, limits: Limits) -> Result<Source> {
-    validate_id(id, limits)?;
     let home = super::codex::codex_home().map_err(|_| Unavailable::Read)?;
+    lookup_codex_rollout_in(&home, id, limits)
+}
+
+pub(crate) fn lookup_codex_rollout_in(home: &Path, id: &str, limits: Limits) -> Result<Source> {
+    validate_id(id, limits)?;
     let mut selected = None;
     let mut visited = 0usize;
     for root in [home.join("sessions"), home.join("archived_sessions")] {

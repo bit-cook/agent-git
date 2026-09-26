@@ -60,6 +60,7 @@ use tokio::sync::{Mutex, mpsc};
 /// "remember to call them" — the looser phrasing that asks "was **my own row** ever dangerous"
 /// compiles just as well, while what `session.resume` hands to `--resume` is a transcript that
 /// several rows can point at.
+mod catalog;
 mod danger;
 mod dispatch;
 mod guard;
@@ -71,6 +72,8 @@ mod restart;
 mod session_metadata;
 mod session_rpc;
 mod sessions;
+mod source_sessions;
+mod source_watch;
 mod watch_rpc;
 
 /// How many adoptable local sessions to list per project at most.
@@ -566,16 +569,16 @@ impl Live {
         // pending until the supervisor really applies it on the next turn and broadcasts
         // Immediate; otherwise an operator can overwrite the stricter mode the owner just queued
         // with the old effective baseline.
-        if p.applied == crate::protocol::PermissionApply::Immediate {
-            self.info.permission_mode = Some(p.mode);
-            if self.pending_mode == Some(p.mode) {
+        if p.native_default || p.applied == crate::protocol::PermissionApply::Immediate {
+            self.info.permission_mode = p.mode;
+            if p.native_default || self.pending_mode == p.mode {
                 self.pending_mode = None;
             }
         }
         // dangerous is a standing fact about the session: even when the loosening takes effect
         // only on the next turn, a daemon restart or another viewer's projection must not forget
         // this owner authorization.
-        self.info.dangerous = self.info.dangerous || p.mode.is_dangerous();
+        self.info.dangerous |= p.mode.is_none_or(|mode| mode.is_dangerous());
     }
 }
 
@@ -1272,6 +1275,17 @@ fn project_turn_start_outcome(
                 "nothing was sent, but this harness generation was retired; resume the session before retrying",
             )),
         ),
+        TurnStartOutcome::SharedUnknown { message } => (
+            SessionRpcCompletion::None,
+            Err(RpcError {
+                code: ErrorCode::RuntimeUnavailable.code(),
+                message,
+                data: Some(serde_json::json!({
+                    "outcome":"unknown", "retryable":false,
+                    "hint":"The shared task continues and output remains subscribed. Check its progress before sending another instruction.",
+                })),
+            }),
+        ),
         TurnStartOutcome::Unknown {
             message,
             attempted_mode,
@@ -1297,6 +1311,15 @@ fn project_permission_mode_outcome(
     recovery_token: String,
 ) -> (SessionRpcCompletion, Result<serde_json::Value, RpcError>) {
     match outcome {
+        PermissionModeOutcome::SharedApplied { applied } => (
+            SessionRpcCompletion::None,
+            Ok(serde_json::json!({"mode":mode,"applied":applied,"native_default":true})),
+        ),
+        PermissionModeOutcome::SharedUnknown { message } => (
+            SessionRpcCompletion::None,
+            Err(RpcError::new(ErrorCode::RuntimeUnavailable, message)
+                .with_hint("native defaults are unconfirmed; the shared task continues and output remains subscribed")),
+        ),
         PermissionModeOutcome::Applied { applied } => (
             SessionRpcCompletion::PermissionMode {
                 mode,
@@ -1356,6 +1379,23 @@ fn project_approval_outcome(
     danger: DangerAuthorization,
 ) -> Option<(SessionRpcCompletion, Result<serde_json::Value, RpcError>)> {
     match outcome {
+        ApprovalOutcome::Resolved | ApprovalOutcome::AwaitingResolution { .. }
+            if trusted_mode.is_some() => None,
+        ApprovalOutcome::Resolved => Some((
+            SessionRpcCompletion::Approval {
+                approval_id, resolved: true, effective_mode: None, fail_closed: false,
+                rollback_arm: None, retire_generation: false,
+            },
+            Ok(serde_json::json!({"resolved":true,"decision_confirmed":false})),
+        )),
+        ApprovalOutcome::AwaitingResolution { message } => Some((
+            SessionRpcCompletion::Approval {
+                approval_id, resolved: false, effective_mode: None, fail_closed: false,
+                rollback_arm: None, retire_generation: false,
+            },
+            Err(RpcError::new(ErrorCode::SessionBusy, message)
+                .with_hint("the decision is not resent; the native service may still resolve this request")),
+        )),
         ApprovalOutcome::Applied { effective_mode } => {
             // Both values originate on the machine but travel through
             // different layers. Refuse to ACK if they ever diverge; retaining
@@ -1535,6 +1575,8 @@ fn min_role(method_name: &str) -> Role {
         // Read-only: see what is on this machine.
         method::WORKSPACE_LIST
         | method::SESSION_LIST
+        | method::SESSION_CATALOG_LIST
+        | method::SESSION_CATALOG_SETTINGS
         | method::SESSION_SUBSCRIBE
         | method::SESSION_COMMANDS
         | method::SESSION_MODEL => Role::Viewer,
@@ -1580,6 +1622,7 @@ fn is_queued_session_rpc(method_name: &str) -> bool {
     matches!(
         method_name,
         method::TURN_START
+            | method::SESSION_ENQUEUE
             | method::TURN_STEER
             | method::SESSION_COMMAND
             | method::SESSION_SET_MODEL
@@ -1601,7 +1644,8 @@ fn queued_session_id(f: &Frame) -> Result<String, RpcError> {
         method::SESSION_COMMANDS
         | method::SESSION_COMMAND
         | method::SESSION_MODEL
-        | method::SESSION_SET_MODEL => Ok(f
+        | method::SESSION_SET_MODEL
+        | method::SESSION_ENQUEUE => Ok(f
             .params_as::<crate::protocol::SessionSubscribe>()?
             .session_id),
         method::TURN_START => Ok(f.params_as::<TurnStart>()?.session_id),
@@ -1947,6 +1991,8 @@ fn require_same_workspace(
 /// can only be stopped by its owner, and the owner may be asleep.
 #[derive(Clone, Copy, PartialEq)]
 enum Need {
+    /// Observe state without acquiring control or passing the writer danger gate.
+    Read,
     /// Interrupt, refuse an approval, tighten the guard. Needs only ownership plus the right to
     /// issue instructions.
     Brake,

@@ -14,7 +14,7 @@ fn open_existing(path: &Path) -> io::Result<File> {
     OpenOptions::new().read(true).write(true).open(path)
 }
 
-fn writer_active_in(home: &Path, thread_id: &str) -> io::Result<bool> {
+pub(crate) fn writer_active_in(home: &Path, thread_id: &str) -> io::Result<bool> {
     let directory = home.join("thread-writer-locks");
     // Native creation and cleanup hold the coordination lock exclusively. Observation
     // must not race with unlinking, create lock files, or wait behind native startup.

@@ -195,8 +195,9 @@ fn hard_deadline_drains_guard_projections_from_a_ready_worker() {
                 let mut permission = Frame::notification(
                     method::SESSION_PERMISSION_MODE,
                     crate::protocol::SessionPermissionMode {
+                        native_default: false,
                         session_id: "session-a".into(),
-                        mode: PermissionMode::Plan,
+                        mode: Some(PermissionMode::Plan),
                         applied: PermissionApply::NextTurn,
                         by: Some("owner".into()),
                     },
@@ -1373,6 +1374,7 @@ fn only_a_fully_negotiated_identity_becomes_settlement_lineage() {
 #[test]
 fn a_legacy_roster_lineage_never_adopts_the_current_slug_identity() {
     let legacy = roster::Entry {
+        native_source: None,
         runtime: "codex".into(),
         thread_id: "thread-1".into(),
         cwd: "/tmp/project".into(),

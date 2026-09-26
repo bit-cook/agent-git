@@ -65,6 +65,7 @@ impl Daemon {
         // creating a command; the retained gate preserves ordering, not stale
         // authority.
         let caller = caller_scope(f)?;
+        let caller_is_owner = caller.is_owner();
         require_role(&caller, f.method())?;
         let frame_session_id = queued_session_id(f)?;
         if frame_session_id != lease.session_id {
@@ -88,6 +89,73 @@ impl Daemon {
         }
 
         let (operation, guard_sensitive) = match f.method() {
+            method::SESSION_ENQUEUE => {
+                let request: crate::rc::native_inbox::Request = f.params_as()?;
+                request
+                    .validate_message()
+                    .map_err(|error| RpcError::new(ErrorCode::MalformedFrame, error.to_string()))?;
+                require_same_workspace(&caller, &session_id, &request.workspace_id)?;
+                let d = self.session_channel(&session_id, &caller, Need::Drive)?;
+                let source = live.info.native_source.clone().ok_or_else(|| {
+                    RpcError::new(
+                        ErrorCode::RuntimeUnavailable,
+                        "this session has no shared native queue",
+                    )
+                })?;
+                let native_id = live.runtime_thread_id.clone().ok_or_else(|| {
+                    RpcError::new(
+                        ErrorCode::SessionBusy,
+                        "native conversation is still opening",
+                    )
+                })?;
+                if live.pending_mode.is_some() {
+                    return Err(RpcError::new(
+                        ErrorCode::SessionBusy,
+                        "apply or clear pending permissions before queueing native work",
+                    ));
+                }
+                let account = caller
+                    .account_id
+                    .clone()
+                    .filter(|account| !account.is_empty())
+                    .ok_or_else(|| {
+                        RpcError::new(
+                            ErrorCode::Unauthenticated,
+                            "queue messages require an authenticated account",
+                        )
+                    })?;
+                let account = if account.starts_with("local:") && caller.is_owner() {
+                    "local-owner".to_owned()
+                } else {
+                    account
+                };
+                let receipts = crate::rc::rc_dir()
+                    .map_err(|error| RpcError::new(ErrorCode::Internal, error.to_string()))?
+                    .join("shared-native-queue");
+                let (ticket, receipt) = crate::rc::ticket::ticket_authorized(f.authority.clone());
+                (
+                    SessionRpcOperation::Value {
+                        tx: d.tx,
+                        command: Command::Enqueue {
+                            caller_is_owner: caller.is_owner(),
+                            request: crate::rc::native_queue::Request {
+                                source,
+                                native_id,
+                                workspace_id: request.workspace_id,
+                                hub: self.opts.hub.clone(),
+                                account,
+                                client_id: request.client_msg_id,
+                                message: request.message,
+                                username: caller.username,
+                                receipts,
+                            },
+                            reply: ticket.with_control_ceiling(caller_is_owner),
+                        },
+                        reply: SessionReceipt(receipt),
+                    },
+                    false,
+                )
+            }
             method::SESSION_COMMAND => {
                 let p: crate::protocol::SessionSubscribe = f.params_as()?;
                 let d = self.session_channel(&p.session_id, &caller, Need::Drive)?;
@@ -113,7 +181,7 @@ impl Daemon {
                         command: Command::Runtime {
                             name,
                             arguments,
-                            reply: ticket,
+                            reply: ticket.with_control_ceiling(caller_is_owner),
                         },
                         reply: SessionReceipt(reply),
                     },
@@ -135,7 +203,7 @@ impl Daemon {
                         tx: d.tx,
                         command: Command::Model {
                             model,
-                            reply: ticket,
+                            reply: ticket.with_control_ceiling(caller_is_owner),
                         },
                         reply: SessionReceipt(reply),
                     },
@@ -163,7 +231,7 @@ impl Daemon {
                                 p.client_msg_id,
                             ),
                             guard_attempt: guard_attempt.clone(),
-                            reply: ticket,
+                            reply: ticket.with_control_ceiling(caller_is_owner),
                         },
                         reply: SessionReceipt(reply),
                         guard_attempt: guard_attempt.clone(),
@@ -185,7 +253,7 @@ impl Daemon {
                                 p.by,
                                 p.client_msg_id,
                             ),
-                            reply: ticket,
+                            reply: ticket.with_control_ceiling(caller_is_owner),
                         },
                         reply: SessionReceipt(reply),
                     },
@@ -242,7 +310,7 @@ impl Daemon {
                             mode: p.mode,
                             by: p.by,
                             armed,
-                            reply: ticket,
+                            reply: ticket.with_control_ceiling(caller_is_owner),
                         },
                         reply: SessionReceipt(reply),
                         mode: p.mode,
@@ -324,7 +392,7 @@ impl Daemon {
                             // any browser-controlled params field.
                             caller_is_owner: f.caller.as_ref().is_some_and(|c| c.is_owner()),
                             danger,
-                            reply: ticket,
+                            reply: ticket.with_control_ceiling(caller_is_owner),
                         },
                         reply: SessionReceipt(reply),
                         approval_id,

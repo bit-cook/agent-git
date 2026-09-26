@@ -126,6 +126,26 @@ impl Registry {
         let mut client = self.client(grant.caller.clone(), grant.expires_at_ms);
         let (state, owners) = (self.state.clone(), self.owners.clone());
         async move {
+            let source = grant
+                .session_controller
+                .as_ref()
+                .filter(|scope| scope.session_id.starts_with("local-"))
+                .map(|scope| scope.session_id.clone());
+            let resource_pin = if let Some(id) = source {
+                let (resources, session) = tokio::task::spawn_blocking(move || {
+                    let mut resources = Resources::load()?;
+                    let session = resources.prepare_controller_source(&id)?;
+                    Ok::<_, anyhow::Error>((resources, session))
+                })
+                .await??;
+                let mut state = state
+                    .write()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                state.resources.refresh(resources);
+                Some(state.resources.pin_controller_source(session)?)
+            } else {
+                None
+            };
             if grant.session_controller.is_some() || grant.project_controller.is_some() {
                 let state = state
                     .read()
@@ -133,6 +153,9 @@ impl Registry {
                 delegation::validate_resources(&grant, &state.resources)?;
             }
             client.controller = owners.accept(&grant).await?;
+            if let Some(controller) = client.controller.as_mut() {
+                controller.resource_pin = resource_pin;
+            }
             Ok(client)
         }
     }

@@ -56,6 +56,7 @@ async fn encrypted_cloud_ingress_filters_fanout_and_cannot_break_owner_rpc() {
         None,
         Some(ingress),
         super::super::Admission::default(),
+        None,
     ));
     let source_identity = Identity::generate().unwrap();
     let target_identity = Identity::generate().unwrap();

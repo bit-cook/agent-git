@@ -11,6 +11,7 @@ impl Drop for LandingTask {
 
 pub(super) struct Landing {
     thread_id: String,
+    native_source: Option<crate::protocol::NativeSourceRef>,
     lease: SettlementState,
     settlement: tokio::sync::watch::Receiver<SettlementState>,
     agit_session: Option<crate::rc::lineage::AgitSession>,
@@ -26,6 +27,7 @@ impl Landing {
     fn capture(session: &Session, thread_id: &str, lease: SettlementState) -> Self {
         Self {
             thread_id: thread_id.into(),
+            native_source: session.info.native_source.clone(),
             lease,
             settlement: session.settlement.clone(),
             agit_session: session.agit_session.clone(),
@@ -72,6 +74,14 @@ impl Landing {
             thread_id,
             &self.cwd.to_string_lossy(),
         );
+        if let Some(source) = &self.native_source {
+            args.extend([
+                "--source-id".into(),
+                source.source_id.clone(),
+                "--source-generation".into(),
+                source.generation.to_string(),
+            ]);
+        }
         if lease.local_owner {
             args.push("--local-owner".into());
         }

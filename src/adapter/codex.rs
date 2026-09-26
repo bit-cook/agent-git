@@ -65,7 +65,7 @@ fn codex_home_from(configured: Option<&OsStr>, home: Option<&OsStr>) -> Option<P
         .or_else(|| home.map(PathBuf::from).map(|path| path.join(".codex")))
 }
 
-pub(super) fn codex_home() -> Result<PathBuf> {
+pub(crate) fn codex_home() -> Result<PathBuf> {
     let home = crate::infra::config::user_home();
     codex_home_from(
         std::env::var_os("CODEX_HOME").as_deref(),
@@ -326,7 +326,26 @@ fn lineage_bytes(
     source: &super::native_snapshot::Source,
     limits: super::native_snapshot::Limits,
     allow_unrecognized_leaf: bool,
+    parent_records_left: Option<usize>,
+) -> super::native_snapshot::Result<Vec<u8>> {
+    lineage_bytes_with_lookup(
+        source,
+        limits,
+        allow_unrecognized_leaf,
+        parent_records_left,
+        super::native_snapshot::lookup_codex_rollout,
+    )
+}
+
+pub(crate) fn lineage_bytes_with_lookup(
+    source: &super::native_snapshot::Source,
+    limits: super::native_snapshot::Limits,
+    allow_unrecognized_leaf: bool,
     mut parent_records_left: Option<usize>,
+    lookup: impl Fn(
+        &str,
+        super::native_snapshot::Limits,
+    ) -> super::native_snapshot::Result<super::native_snapshot::Source>,
 ) -> super::native_snapshot::Result<Vec<u8>> {
     use super::native_snapshot::Unavailable;
 
@@ -365,7 +384,7 @@ fn lineage_bytes(
         let Some(next) = next else {
             break;
         };
-        current = super::native_snapshot::lookup_codex_rollout(
+        current = lookup(
             &next,
             super::native_snapshot::Limits {
                 lookup_entries: limits.lookup_entries.saturating_sub(visited.len()),

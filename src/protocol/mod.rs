@@ -555,6 +555,8 @@ pub mod method {
     pub const TERMINAL_EXITED: &str = "terminal.exited";
     pub const SESSION_START: &str = "session.start";
     pub const SESSION_RESUME: &str = "session.resume";
+    pub const SESSION_CATALOG_LIST: &str = "session.catalog.list";
+    pub const SESSION_CATALOG_SETTINGS: &str = "session.catalog.settings";
     pub const SESSION_LIST: &str = "session.list";
     pub const SESSION_SUBSCRIBE: &str = "session.subscribe";
     pub const SESSION_WATCH: &str = "session.watch";
@@ -589,6 +591,7 @@ pub mod method {
     // Approval requests are stream notifications. `approval.decide` is the
     // separate relayed command above; the two correlate by `approval_id`.
     pub const APPROVAL_REQUEST: &str = "approval.request";
+    pub const APPROVAL_RESOLVED: &str = "approval.resolved";
 }
 
 #[cfg(test)]
@@ -775,6 +778,7 @@ mod tests {
 
         let session = SessionInfo {
             session_id: "agit-one".into(),
+            native_source: None,
             runtime_session_id: None,
             workspace_id: "ws-1".into(),
             project_id: Some("p-1".into()),

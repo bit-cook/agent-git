@@ -1938,7 +1938,7 @@ fn settle_bytes(
         }
     } else {
         secret_dictionary
-            .protect_session_jsonl(&text, &global_secrets, &lk.source, &lk.session_id, Path::new(lk.cwd.as_deref().unwrap_or(".")))
+            .protect_source_session_jsonl(&text, &global_secrets, &lk.source, lk.native_thread_id(), &lk.session_id, Path::new(lk.cwd.as_deref().unwrap_or(".")))
             .map_err(|error| {
                 anyhow::anyhow!(
                     "cannot protect this session's secrets before committing: {error:#}\n\
@@ -2380,10 +2380,11 @@ fn settle_bytes(
     // A value learned from an observation can also occur in the transcript. Finish discovery
     // before constructing content-addressed events so both surfaces use the same dictionary.
     if protected_observations.new_heuristic_records > 0 {
-        let projected = secret_dictionary.protect_session_jsonl(
+        let projected = secret_dictionary.protect_source_session_jsonl(
             &text,
             &global_secrets,
             &lk.source,
+            lk.native_thread_id(),
             &lk.session_id,
             Path::new(&cwd),
         )?;
@@ -2496,10 +2497,11 @@ fn settle_bytes(
             let (base_log, base_view) = materialized_base
                 .as_ref()
                 .expect("materialized history retains its committed LOG and VIEW");
-            let protected_addition = secret_dictionary.protect_session_jsonl(
+            let protected_addition = secret_dictionary.protect_source_session_jsonl(
                 &region[..c.end_byte],
                 &global_secrets,
                 &lk.source,
+                lk.native_thread_id(),
                 &lk.session_id,
                 Path::new(&cwd),
             )?;

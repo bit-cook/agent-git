@@ -62,9 +62,12 @@ pub struct Thread {
 /// The name carries a version number (`state_5.sqlite`); take the highest number. None if there
 /// is none.
 pub fn index_path() -> Option<PathBuf> {
-    let dir = super::codex::codex_home().ok()?;
+    index_path_in(&super::codex::codex_home().ok()?)
+}
+
+pub fn index_path_in(dir: &Path) -> Option<PathBuf> {
     let mut best: Option<(u32, PathBuf)> = None;
-    for e in std::fs::read_dir(&dir).ok()? {
+    for e in std::fs::read_dir(dir).ok()? {
         let Ok(e) = e else { continue };
         let p = e.path();
         let Some(name) = p.file_name().and_then(|x| x.to_str()) else {
@@ -241,13 +244,56 @@ pub fn all_threads() -> Option<Vec<Thread>> {
     Some(rows.filter_map(|r| r.ok()).collect())
 }
 
+/// A bounded native index page advances even when workspace admission hides every row.
+pub struct ThreadPage {
+    pub threads: Vec<Thread>,
+    pub next_cursor: Option<String>,
+}
+
+pub fn thread_page_in(home: &Path, after: Option<&str>, limit: usize) -> crate::Result<ThreadPage> {
+    use anyhow::{Context, ensure};
+    ensure!(
+        (1..=500).contains(&limit),
+        "native page limit must be between 1 and 500"
+    );
+    let path = index_path_in(home).context("native index is unavailable")?;
+    let con = open(&path).context("native index cannot be opened")?;
+    ensure!(schema_ok(&con), "native index schema is unsupported");
+    con.busy_timeout(std::time::Duration::from_millis(100))?;
+    let sql = format!(
+        "{} WHERE archived = 0 AND rollout_path IS NOT NULL AND id COLLATE BINARY > ?1 ORDER BY id COLLATE BINARY LIMIT ?2",
+        select(&con)
+    );
+    let mut statement = con.prepare(&sql)?;
+    let mut threads: Vec<Thread> = statement
+        .query_map(
+            rusqlite::params![after.unwrap_or(""), limit + 1],
+            row_to_thread,
+        )?
+        .collect::<rusqlite::Result<_>>()?;
+    let more = threads.len() > limit;
+    threads.truncate(limit);
+    let next_cursor = more
+        .then(|| threads.last().map(|thread| thread.id.clone()))
+        .flatten();
+    Ok(ThreadPage {
+        threads,
+        next_cursor,
+    })
+}
+
 /// Exact lookup of one thread by id. Observed at 0.40 ms; id is unique in the table.
 ///
 /// No `archived = 0` here: an explicit id means the user knows which one they want, and
 /// filtering on their behalf turns into "it exists, yet it is reported missing". Only the list
 /// case needs deleted rows filtered out.
 pub fn thread_by_id(id: &str) -> Option<Thread> {
-    let con = open(&index_path()?)?;
+    thread_by_id_in(&super::codex::codex_home().ok()?, id)
+}
+
+/// Native identities are unique within their source, not across registered homes.
+pub fn thread_by_id_in(home: &Path, id: &str) -> Option<Thread> {
+    let con = open(&index_path_in(home)?)?;
     if !schema_ok(&con) {
         return None;
     }
@@ -476,6 +522,28 @@ mod tests {
     fn q_cwd(p: &Path, cwd: &str) -> Vec<Thread> {
         let con = open(p).unwrap();
         threads_for_cwd_at(&con, cwd, false).unwrap()
+    }
+
+    #[test]
+    fn identical_native_ids_stay_within_the_selected_home() {
+        let (first, _) = fixture();
+        let (second, database) = fixture();
+        Connection::open(database)
+            .unwrap()
+            .execute(
+                "UPDATE threads SET rollout_path = '/other/a.jsonl' WHERE id = 'id-a'",
+                [],
+            )
+            .unwrap();
+        assert_eq!(
+            thread_by_id_in(first.path(), "id-a").unwrap().rollout_path,
+            PathBuf::from("/s/a.jsonl")
+        );
+        assert_eq!(
+            thread_by_id_in(second.path(), "id-a").unwrap().rollout_path,
+            PathBuf::from("/other/a.jsonl")
+        );
+        assert!(thread_by_id_in(&first.path().join("missing-home"), "id-a").is_none());
     }
 
     #[test]

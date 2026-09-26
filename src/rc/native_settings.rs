@@ -6,7 +6,7 @@ use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 
 #[derive(Clone, Default)]
-pub(super) struct Settings {
+pub(crate) struct Settings {
     pub permission_mode: Option<PermissionMode>,
     model: Option<String>,
     effort: Option<String>,
@@ -51,6 +51,24 @@ fn settings(value: &Value) -> Settings {
     }
 }
 
+pub(super) fn native_reply(value: &Value) -> Settings {
+    settings(&json!({
+        "model": value["model"],
+        "effort": value["reasoningEffort"],
+        "approval_policy": value["approvalPolicy"],
+        "sandbox_policy": value["sandbox"]
+    }))
+}
+
+pub(super) fn thread_settings(value: &Value) -> Settings {
+    settings(&json!({
+        "model": value["model"],
+        "effort": value["effort"],
+        "approval_policy": value["approvalPolicy"],
+        "sandbox_policy": value["sandboxPolicy"]
+    }))
+}
+
 pub(super) fn context(line: &str) -> Option<Settings> {
     let record: Value = serde_json::from_str(line).ok()?;
     (record["type"] == "turn_context").then(|| settings(&record["payload"]))
@@ -60,19 +78,33 @@ pub(super) fn read_codex(path: &Path, session: &str) -> Settings {
     if let Some(observed) = indexed(path, session) {
         return observed;
     }
+    transcript_settings(path)
+}
+
+pub(super) fn read_codex_in(home: &Path, path: &Path, session: &str) -> Settings {
+    crate::adapter::codex_index::index_path_in(home)
+        .and_then(|index| indexed_at(&index, path, session))
+        .unwrap_or_else(|| transcript_settings(path))
+}
+
+fn transcript_settings(path: &Path) -> Settings {
+    transcript_context(path).map_or_else(Settings::default, |value| settings(&value))
+}
+
+fn transcript_context(path: &Path) -> Option<Value> {
     let Ok(mut file) = std::fs::File::open(path) else {
-        return Settings::default();
+        return None;
     };
     let Ok(metadata) = file.metadata() else {
-        return Settings::default();
+        return None;
     };
     let start = metadata.len().saturating_sub(4 * 1024 * 1024);
     if file.seek(SeekFrom::Start(start)).is_err() {
-        return Settings::default();
+        return None;
     }
     let mut bytes = Vec::new();
     if file.take(4 * 1024 * 1024).read_to_end(&mut bytes).is_err() {
-        return Settings::default();
+        return None;
     }
     let mut lines = bytes.split(|byte| *byte == b'\n');
     if start != 0 {
@@ -84,10 +116,10 @@ pub(super) fn read_codex(path: &Path, session: &str) -> Settings {
     if !complete {
         rows.pop();
     }
-    rows.into_iter()
-        .rev()
-        .find_map(|line| std::str::from_utf8(line).ok().and_then(context))
-        .unwrap_or_default()
+    rows.into_iter().rev().find_map(|line| {
+        let record: Value = serde_json::from_slice(line).ok()?;
+        (record["type"] == "turn_context").then(|| record["payload"].clone())
+    })
 }
 
 fn indexed(path: &Path, session: &str) -> Option<Settings> {
@@ -104,10 +136,20 @@ pub(super) fn indexed_at(index: &Path, path: &Path, session: &str) -> Option<Set
         rusqlite::params![session,path.to_str()?],
         |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?)),
     ).ok()?;
-    let sandbox: Value = serde_json::from_str(&values.3).ok()?;
-    Some(settings(
+    let sandbox: Value = serde_json::from_str(&values.3).unwrap_or(Value::Null);
+    let mut observed = settings(
         &json!({"model":values.0,"effort":values.1,"approval_policy":values.2,"sandbox_policy":sandbox}),
-    ))
+    );
+    // A native legacy projection is current only while its full profile and approval policy match the index.
+    if observed.permission_mode.is_none()
+        && sandbox["type"] == "managed"
+        && let Some(context) = transcript_context(path)
+        && context["permission_profile"] == sandbox
+        && context["approval_policy"] == values.2
+    {
+        observed.permission_mode = settings(&context).permission_mode;
+    }
+    Some(observed)
 }
 
 #[cfg(test)]
@@ -140,5 +182,49 @@ mod tests {
         assert_eq!(observed.model()["model"], "selected-model");
         assert_eq!(observed.permission_mode, Some(PermissionMode::Bypass));
         assert!(indexed_at(index.path(), file.path(), "other").is_none());
+        let profile = json!({"type":"managed","file_system":{"type":"restricted","entries":[
+            {"path":{"type":"special","value":{"kind":"root"}},"access":"read"},
+            {"path":{"type":"path","path":"/project"},"access":"write"}
+        ]},"network":"restricted"});
+        std::fs::write(
+            file.path(),
+            format!(
+                "{}\n",
+                json!({"type":"turn_context","payload":{
+                    "model":"transcript-model","approval_policy":"on-request",
+                    "sandbox_policy":{"type":"workspace-write"},"permission_profile":profile
+                }})
+            ),
+        )
+        .unwrap();
+        db.execute(
+            "UPDATE threads SET approval_mode='on-request',sandbox_policy=?1",
+            [profile.to_string()],
+        )
+        .unwrap();
+        let observed = indexed_at(index.path(), file.path(), "native").unwrap();
+        assert_eq!(observed.permission_mode, Some(PermissionMode::Default));
+        assert_eq!(observed.model()["model"], "selected-model");
+        let mut changed = profile;
+        changed["network"] = json!("enabled");
+        db.execute(
+            "UPDATE threads SET sandbox_policy=?1",
+            [changed.to_string()],
+        )
+        .unwrap();
+        assert!(
+            indexed_at(index.path(), file.path(), "native")
+                .unwrap()
+                .permission_mode
+                .is_none()
+        );
+        db.execute("UPDATE threads SET sandbox_policy='unrecognized'", [])
+            .unwrap();
+        assert!(
+            indexed_at(index.path(), file.path(), "native")
+                .unwrap()
+                .permission_mode
+                .is_none()
+        );
     }
 }

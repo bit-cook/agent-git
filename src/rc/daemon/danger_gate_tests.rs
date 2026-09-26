@@ -245,6 +245,7 @@ fn a_failed_danger_ledger_write_never_reaches_the_approval_driver() {
                 let (cmd_tx, mut cmd_rx) = mpsc::channel(1);
                 let info = SessionInfo {
                     session_id: "session-1".into(),
+                    native_source: None,
                     runtime_session_id: None,
                     workspace_id: "ws1".into(),
                     project_id: Some("project-1".into()),
@@ -264,6 +265,7 @@ fn a_failed_danger_ledger_write_never_reaches_the_approval_driver() {
                 roster.sessions.insert(
                     "session-1".into(),
                     roster::Entry {
+                        native_source: None,
                         runtime: "claude-code".into(),
                         thread_id: "native-1".into(),
                         cwd: "/tmp".into(),
